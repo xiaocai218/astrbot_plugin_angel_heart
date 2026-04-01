@@ -136,6 +136,11 @@ class ConfigManager:
         """是否启用安抚机制。"""
         return self._config.get("patience_enabled", True)
 
+    @property
+    def reminder_future_task_enabled(self) -> bool:
+        """是否启用提醒语句到 AstrBot 未来任务的桥接。"""
+        return self._config.get("reminder_future_task_enabled", True)
+
     # ========== 4状态机制新增配置 ==========
 
     @property
@@ -354,6 +359,7 @@ class ConfigManager:
                 "force_reply_when_summoned": self.force_reply_when_summoned,
                 "comfort_words": self.comfort_words,
                 "patience_enabled": self.patience_enabled,
+                "reminder_future_task_enabled": self.reminder_future_task_enabled,
                 "slap_words": self.slap_words,
                 "silence_duration": self.silence_duration,
             },

@@ -26,6 +26,7 @@ from ..core.image_processor import ImageProcessor
 
 from ..core.fishing_direct_reply import FishingDirectReply
 from ..core.message_processor import MessageProcessor
+from ..core.reminder_task_bridge import ReminderTaskBridge
 
 # 导入状态枚举
 from ..core.angel_heart_status import AngelHeartStatus
@@ -59,6 +60,7 @@ class FrontDesk:
 
         # 初始化混脸熟直接回复处理器
         self.fishing_reply = FishingDirectReply(config_manager, angel_context)
+        self.reminder_task_bridge = ReminderTaskBridge(config_manager, angel_context)
 
         # secretary 引用将由 main.py 设置
         self.secretary = None
@@ -276,6 +278,11 @@ class FrontDesk:
 
             # 4. 【核心】缓存消息
             await self.cache_message(chat_id, event)
+
+            # 4.1 明确提醒请求优先桥接到 AstrBot future task，避免主模型口头答应但未建任务
+            if await self.reminder_task_bridge.try_handle(event):
+                logger.debug(f"AngelHeart[{chat_id}]: 提醒桥接已接管本轮消息")
+                return
 
             # 私聊由主框架直接响应，这里只负责缓存，不走秘书分析链路
             if self._is_private_chat(chat_id):
@@ -1112,3 +1119,5 @@ class FrontDesk:
     @config_manager.setter
     def config_manager(self, value):
         self._config_manager = value
+        if hasattr(self, "reminder_task_bridge"):
+            self.reminder_task_bridge.config_manager = value

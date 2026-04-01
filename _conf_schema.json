@@ -249,6 +249,12 @@
     "hint": "关闭后，AI 思考期间不再发送“请稍等”类安抚消息。",
     "default": true
   },
+  "reminder_future_task_enabled": {
+    "type": "bool",
+    "description": "[提醒桥接] 启用提醒落未来任务",
+    "hint": "启用后，像“明天早上8点提醒我开会”这类明确提醒请求会直接创建 AstrBot 未来任务，不再依赖主模型自己调用工具。",
+    "default": true
+  },
   "comfort_words": {
     "type": "string",
     "description": "[安抚机制] 安心词",
