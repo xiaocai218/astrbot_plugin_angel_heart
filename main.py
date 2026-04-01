@@ -557,7 +557,16 @@ class AngelHeartPlugin(Star):
             logger.error(f"AngelHeart[{chat_id}]: after_message_sent处理异常: {e}", exc_info=True)
         finally:
             try:
-                # 3. 释放处理锁（设置冷却期）
+                # 3. 清理一次性秘书决策，避免串到后续轮次请求。
+                await self.angel_context.clear_decision(chat_id)
+            except Exception as clear_error:
+                logger.error(
+                    f"AngelHeart[{chat_id}]: after_message_sent 清理秘书决策异常: {clear_error}",
+                    exc_info=True,
+                )
+
+            try:
+                # 4. 释放处理锁（设置冷却期）
                 await self.angel_context.release_chat_processing(chat_id, set_cooldown=True)
                 logger.info(f"AngelHeart[{chat_id}]: 任务处理完成，已在消息发送后释放处理锁。")
             except Exception as release_error:

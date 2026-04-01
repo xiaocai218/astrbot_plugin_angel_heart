@@ -6,10 +6,23 @@
     "_special": "select_provider",
     "default": ""
   },
+  "deputy_analyzer_model": {
+    "type": "string",
+    "description": "[基础配置] 副秘书模型",
+    "hint": "当主秘书模型限速、超时、不可用时自动接管分析的备用模型提供商。",
+    "_special": "select_provider",
+    "default": ""
+  },
   "is_reasoning_model": {
     "type": "bool",
     "description": "[基础配置] 是否是思维模型",
     "hint": "供应商是否是思维模型，非思维模型会引导推理。",
+    "default": false
+  },
+  "deputy_is_reasoning_model": {
+    "type": "bool",
+    "description": "[基础配置] 副秘书是否是思维模型",
+    "hint": "副秘书模型是否使用思维模型输出模式。未单独配置时建议与主秘书保持一致。",
     "default": false
   },
   "waiting_time": {
@@ -41,6 +54,66 @@
     "description": "[基础配置] 观测中超时时间（秒）",
     "hint": "多长时间无活动自动降级。",
     "default": 600
+  },
+  "observation_min_messages": {
+    "type": "int",
+    "description": "[基础配置] 观测中回复阈值",
+    "hint": "进入观测状态后，至少累计多少条未处理用户消息，秘书才会再次分析是否介入。建议 2 或 3。",
+    "default": 2
+  },
+  "air_reading_enabled": {
+    "type": "bool",
+    "description": "[读空气] 启用读空气预筛",
+    "hint": "启用后，会在秘书分析前做一层本地规则判断，优先减少不合时宜的插话。",
+    "default": true
+  },
+  "air_reading_suppress_threshold": {
+    "type": "int",
+    "description": "[读空气] 压制阈值",
+    "hint": "读空气评分低于或等于该值时，秘书优先选择继续观察。默认偏保守，建议 -2。",
+    "default": -2
+  },
+  "air_reading_ignore_window_messages": {
+    "type": "int",
+    "description": "[读空气] 无视判定条数",
+    "hint": "AI 上次发言后，如果连续多少条用户消息都没有接 AI，则判为近期被无视。",
+    "default": 3
+  },
+  "air_reading_suppress_human_to_human": {
+    "type": "bool",
+    "description": "[读空气] 压制群友互聊",
+    "hint": "启用后，明显是群友彼此接话、未指向 AI 的场景会优先被压制。",
+    "default": true
+  },
+  "air_reading_suppress_ignored_recently": {
+    "type": "bool",
+    "description": "[读空气] 压制近期被无视后继续介入",
+    "hint": "启用后，AI 刚被连续无视后，后续主动介入会优先被压制。",
+    "default": true
+  },
+  "air_reading_suppress_heated": {
+    "type": "bool",
+    "description": "[读空气] 压制火药味场景",
+    "hint": "启用后，争执、骂战、阴阳明显的场景会优先被压制。",
+    "default": true
+  },
+  "air_reading_suppress_smalltalk": {
+    "type": "bool",
+    "description": "[读空气] 压制低信息量闲聊",
+    "hint": "启用后，纯寒暄、接梗、低价值短句场景会优先被压制。",
+    "default": true
+  },
+  "air_reading_heated_keywords": {
+    "type": "string",
+    "description": "[读空气] 火药味关键词",
+    "hint": "多个关键词使用 | 分隔。命中后优先压制主动介入。",
+    "default": "傻逼|滚|闭嘴|有病|脑残|吵|骂|喷|急了|破防"
+  },
+  "air_reading_smalltalk_patterns": {
+    "type": "string",
+    "description": "[读空气] 寒暄/接梗关键词",
+    "hint": "多个关键词使用 | 分隔。用于识别低信息量闲聊和接梗。",
+    "default": "哈哈|呵呵|牛|6|草|行吧|确实|笑死|晚安|早|早安|哦哦|嗯嗯"
   },
 
   "leave_echo_reply": {
@@ -169,6 +242,12 @@
     "description": "[安抚机制] 久等间隔（秒）",
     "hint": "耐心计时器各阶段之间的时间间隔。",
     "default": 10
+  },
+  "patience_enabled": {
+    "type": "bool",
+    "description": "[安抚机制] 启用安抚机制",
+    "hint": "关闭后，AI 思考期间不再发送“请稍等”类安抚消息。",
+    "default": true
   },
   "comfort_words": {
     "type": "string",

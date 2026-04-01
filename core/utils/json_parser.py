@@ -52,6 +52,23 @@ def _find_json_candidates(text: str) -> List[str]:
     return candidates
 
 
+def _extract_fenced_json_blocks(text: str) -> List[str]:
+    """提取 ```json ... ``` 代码块中的内容。"""
+    if not text:
+        return []
+
+    blocks: List[str] = []
+    parts = text.split("```")
+    for i in range(1, len(parts), 2):
+        block = parts[i].strip()
+        if not block:
+            continue
+        if block.lower().startswith("json"):
+            block = block[4:].strip()
+        blocks.append(block)
+    return blocks
+
+
 class JsonParser:
     """
     高鲁棒性 JSON 解析器类。
@@ -128,32 +145,53 @@ class JsonParser:
             else:
                 return None
 
-        # 2) 去掉代码围栏
-        json_part = _strip_code_fences(json_part)
+        # 2) 优先提取 fenced json；若没有，再在整体文本中扫描平衡大括号。
+        fenced_blocks = _extract_fenced_json_blocks(json_part)
+        candidate_sources: List[tuple[str, int]] = []
 
-        # 3) 扫描所有平衡的大括号候选
-        candidates = _find_json_candidates(json_part)
-        # 扫描候选
+        for idx, block in enumerate(fenced_blocks):
+            candidate_sources.append((block, idx))
 
-        # 4) 筛选与评分
+        if not candidate_sources:
+            json_part = _strip_code_fences(json_part)
+            for idx, candidate in enumerate(_find_json_candidates(json_part)):
+                candidate_sources.append((candidate, idx))
+
+        # 3) 筛选与评分
         qualified_jsons = []
-        for candidate_str in candidates:
+        for order, (candidate_str, source_index) in enumerate(candidate_sources):
             try:
                 parsed_json = json.loads(candidate_str)
                 if not isinstance(parsed_json, dict):
                     continue  # 只处理对象类型的JSON
 
                 # 硬性条件：检查必须字段
+                required_match_count = 0
                 if required_fields:
-                    if not all(field in parsed_json for field in required_fields):
+                    required_match_count = sum(
+                        1 for field in required_fields if field in parsed_json
+                    )
+                    if required_match_count != len(required_fields):
                         continue
+                elif required_fields is None:
+                    required_match_count = 0
 
                 # 计算分数
-                score = 0
+                optional_match_count = 0
                 if optional_fields:
-                    score = sum(1 for field in optional_fields if field in parsed_json)
+                    optional_match_count = sum(
+                        1 for field in optional_fields if field in parsed_json
+                    )
 
-                qualified_jsons.append({"json": parsed_json, "score": score})
+                qualified_jsons.append(
+                    {
+                        "json": parsed_json,
+                        "optional_match_count": optional_match_count,
+                        "required_match_count": required_match_count,
+                        "source_index": source_index,
+                        "order": order,
+                    }
+                )
 
             except json.JSONDecodeError:
                 continue  # 解析失败，不是有效的JSON，跳过
@@ -161,8 +199,14 @@ class JsonParser:
         if not qualified_jsons:
             return None
 
-        # 5) 决策：选择分数最高的，同分则取最后的
-        # 先按分数排序（稳定排序），然后取最后一个，这样就能保证在分数相同时，选择原文中位置更靠后的
-        qualified_jsons.sort(key=lambda x: x["score"])
+        # 4) 决策：优先更多可选字段，其次更多必填字段，再取更靠后的候选。
+        qualified_jsons.sort(
+            key=lambda x: (
+                x["optional_match_count"],
+                x["required_match_count"],
+                x["source_index"],
+                x["order"],
+            )
+        )
         best_json_item = qualified_jsons[-1]
         return best_json_item["json"]

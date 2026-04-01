@@ -12,6 +12,7 @@ from enum import Enum
 from ..core.utils import json_serialize_context
 
 from ..core.llm_analyzer import LLMAnalyzer
+from ..core.air_reading import AirReadingAnalyzer, AirReadingSignal
 from ..models.analysis_result import SecretaryDecision
 from ..core.angel_heart_status import StatusChecker, AngelHeartStatus
 from astrbot.api.event import AstrMessageEvent
@@ -60,6 +61,7 @@ class Secretary:
         self.llm_analyzer = LLMAnalyzer(
             analyzer_model_name, context, reply_strategy_guide, self.config_manager
         )
+        self.air_reading_analyzer = AirReadingAnalyzer(config_manager)
 
     async def handle_message_by_state(self, event: AstrMessageEvent) -> SecretaryDecision:
         """
@@ -85,22 +87,36 @@ class Secretary:
                 await self.angel_context.status_transition_manager.transition_to_status(
                     chat_id, AngelHeartStatus.SUMMONED, "检测到呼唤"
                 )
-            return await self._handle_summoned_reply(event, chat_id)
+            decision = await self._handle_summoned_reply(event, chat_id)
+            self._log_analysis_result(chat_id, AngelHeartStatus.SUMMONED.value, decision)
+            return decision
 
         # 根据当前状态选择处理方式
         if current_status == AngelHeartStatus.GETTING_FAMILIAR:
-            return await self._handle_familiarity_reply(event, chat_id)
+            decision = await self._handle_familiarity_reply(event, chat_id)
         elif current_status == AngelHeartStatus.SUMMONED:
-            return await self._handle_summoned_reply(event, chat_id)
+            decision = await self._handle_summoned_reply(event, chat_id)
         elif current_status == AngelHeartStatus.OBSERVATION:
-            return await self._handle_observation_reply(event, chat_id)
+            decision = await self._handle_observation_reply(event, chat_id)
         else:
             # 不在场：检查触发条件
-            return await self._handle_not_present_check(event, chat_id)
+            decision = await self._handle_not_present_check(event, chat_id)
+
+        self._log_analysis_result(chat_id, current_status.value, decision)
+        return decision
 
     async def _handle_familiarity_reply(self, event: AstrMessageEvent, chat_id: str) -> SecretaryDecision:
         """处理混脸熟状态 - 快速回复"""
         try:
+            historical_context, recent_dialogue, air_signal = self._prepare_air_analysis(
+                chat_id,
+                AngelHeartStatus.GETTING_FAMILIAR,
+                allow_suppression=True,
+            )
+            self._log_air_reading_signal(chat_id, air_signal)
+            if air_signal.should_suppress:
+                return self._build_suppressed_decision(air_signal, "混脸熟压制")
+
             # 检测实际触发类型
             if self.status_checker._detect_echo_chamber(chat_id):
                 trigger_type = "echo_chamber"
@@ -116,6 +132,7 @@ class Secretary:
             decision = await fishing_reply.generate_reply_strategy(
                 chat_id, event, trigger_type
             )
+            self._attach_air_signal(decision, air_signal)
 
             return decision
 
@@ -132,8 +149,10 @@ class Secretary:
             logger.info(f"AngelHeart[{chat_id}]: 秘书处理被呼唤状态")
 
             # 获取上下文
-            historical_context, recent_dialogue, boundary_ts = (
-                self.angel_context.conversation_ledger.get_context_snapshot(chat_id)
+            historical_context, recent_dialogue, air_signal = self._prepare_air_analysis(
+                chat_id,
+                AngelHeartStatus.SUMMONED,
+                allow_suppression=False,
             )
 
             if not recent_dialogue:
@@ -144,7 +163,8 @@ class Secretary:
                 )
 
             # 执行分析
-            decision = await self.perform_analysis(recent_dialogue, historical_context, chat_id)
+            self._log_air_reading_signal(chat_id, air_signal)
+            decision = await self.perform_analysis(recent_dialogue, historical_context, chat_id, air_signal=air_signal)
 
             # 根据配置决定是否强制回复
             if self.config_manager.force_reply_when_summoned:
@@ -166,8 +186,10 @@ class Secretary:
             logger.info(f"AngelHeart[{chat_id}]: 秘书处理观测中状态")
 
             # 获取上下文
-            historical_context, recent_dialogue, boundary_ts = (
-                self.angel_context.conversation_ledger.get_context_snapshot(chat_id)
+            historical_context, recent_dialogue, air_signal = self._prepare_air_analysis(
+                chat_id,
+                AngelHeartStatus.OBSERVATION,
+                allow_suppression=True,
             )
 
             if not recent_dialogue:
@@ -177,8 +199,20 @@ class Secretary:
                     entities=[], facts=[], keywords=[]
                 )
 
+            user_message_count = self._count_recent_user_messages(recent_dialogue)
+            min_messages = self.config_manager.observation_min_messages
+            if user_message_count < min_messages:
+                logger.info(
+                    f"AngelHeart[{chat_id}]: 观测中累计用户消息 {user_message_count}/{min_messages}，继续观察。"
+                )
+                return SecretaryDecision(
+                    should_reply=False, reply_strategy="继续观察", topic="观测阈值未达",
+                    entities=[], facts=[], keywords=[]
+                )
+
             # 执行分析
-            decision = await self.perform_analysis(recent_dialogue, historical_context, chat_id)
+            self._log_air_reading_signal(chat_id, air_signal)
+            decision = await self.perform_analysis(recent_dialogue, historical_context, chat_id, air_signal=air_signal)
 
             return decision
 
@@ -188,6 +222,106 @@ class Secretary:
                 should_reply=False, reply_strategy="处理异常", topic="未知",
                 entities=[], facts=[], keywords=[]
             )
+
+    def _count_recent_user_messages(self, recent_dialogue: List[Dict]) -> int:
+        """统计最近未处理消息中的用户消息数量。"""
+        return sum(1 for msg in recent_dialogue if msg.get("role") == "user")
+
+    def _build_air_signal(
+        self,
+        chat_id: str,
+        historical_context: List[Dict],
+        recent_dialogue: List[Dict],
+        current_status: AngelHeartStatus,
+        allow_suppression: bool,
+    ) -> AirReadingSignal:
+        """构建当前轮的读空气信号。"""
+        if not self.config_manager.air_reading_enabled:
+            return AirReadingSignal()
+
+        return self.air_reading_analyzer.analyze(
+            chat_id=chat_id,
+            historical_context=historical_context,
+            recent_dialogue=recent_dialogue,
+            current_status=current_status,
+            allow_suppression=allow_suppression,
+        )
+
+    def _prepare_air_analysis(
+        self,
+        chat_id: str,
+        current_status: AngelHeartStatus,
+        allow_suppression: bool,
+    ) -> tuple[List[Dict], List[Dict], AirReadingSignal]:
+        """统一获取上下文快照和读空气信号。"""
+        historical_context, recent_dialogue, _ = (
+            self.angel_context.conversation_ledger.get_context_snapshot(chat_id)
+        )
+        air_signal = self._build_air_signal(
+            chat_id,
+            historical_context,
+            recent_dialogue,
+            current_status,
+            allow_suppression=allow_suppression,
+        )
+        return historical_context, recent_dialogue, air_signal
+
+    def _attach_air_signal(self, decision: SecretaryDecision, air_signal: AirReadingSignal) -> SecretaryDecision:
+        """把读空气信号附着到决策对象。"""
+        decision.air_score = air_signal.air_score
+        decision.should_suppress = air_signal.should_suppress
+        decision.suppression_reason = air_signal.suppression_reason
+        decision.conversation_mode = air_signal.conversation_mode
+        decision.engagement_hint = air_signal.engagement_hint
+        return decision
+
+    def _build_suppressed_decision(self, air_signal: AirReadingSignal, topic: str) -> SecretaryDecision:
+        """构造一个被读空气压制的不参与决策。"""
+        decision = SecretaryDecision(
+            should_reply=False,
+            reply_strategy=air_signal.suppression_reason or "继续观察",
+            topic=topic,
+            entities=[],
+            facts=[],
+            keywords=[],
+        )
+        return self._attach_air_signal(decision, air_signal)
+
+    def _log_air_reading_signal(self, chat_id: str, air_signal: AirReadingSignal) -> None:
+        """输出统一的读空气诊断日志。"""
+        logger.info(
+            f"AngelHeart[{chat_id}]: 读空气预判 | mode={air_signal.conversation_mode} "
+            f"| score={air_signal.air_score} | suppress={air_signal.should_suppress} "
+            f"| reason={air_signal.suppression_reason or 'none'} "
+            f"| engagement={air_signal.engagement_hint}"
+        )
+        if air_signal.should_suppress:
+            logger.info(
+                f"AngelHeart[{chat_id}]: 读空气压制 | reason={air_signal.suppression_reason or 'continue_observing'} "
+                f"| score={air_signal.air_score}"
+            )
+        else:
+            logger.info(
+                f"AngelHeart[{chat_id}]: 读空气放行 | mode={air_signal.conversation_mode} "
+                f"| score={air_signal.air_score}"
+            )
+
+    def _log_analysis_result(self, chat_id: str, state_name: str, decision: SecretaryDecision) -> None:
+        """统一记录秘书分析结果，便于直接观察参与/不参与结论。"""
+        strategy = decision.reply_strategy or "未提供原因"
+        topic = decision.topic or "未知"
+
+        if decision.should_reply:
+            logger.info(
+                f"AngelHeart[{chat_id}]: 秘书分析完成，决定参与回复。状态: {state_name}，"
+                f"策略: {strategy}，话题: {topic}"
+            )
+            return
+
+        logger.info(
+            f"AngelHeart[{chat_id}]: 秘书分析完成，决定不参与回复。状态: {state_name}，"
+            f"原因: {strategy}，话题: {topic}"
+        )
 
     async def _handle_not_present_check(self, event: AstrMessageEvent, chat_id: str) -> SecretaryDecision:
         """处理不在场状态 - 检查触发条件"""
@@ -226,7 +360,11 @@ class Secretary:
             )
 
     async def perform_analysis(
-        self, recent_dialogue: List[Dict], db_history: List[Dict], chat_id: str
+        self,
+        recent_dialogue: List[Dict],
+        db_history: List[Dict],
+        chat_id: str,
+        air_signal: AirReadingSignal | None = None,
     ) -> SecretaryDecision:
         """
         秘书职责：分析缓存内容并做出决策。
@@ -245,7 +383,10 @@ class Secretary:
         try:
             # 调用分析器进行决策，传递结构化的上下文
             decision = await self.llm_analyzer.analyze_and_decide(
-                historical_context=db_history, recent_dialogue=recent_dialogue, chat_id=chat_id
+                historical_context=db_history,
+                recent_dialogue=recent_dialogue,
+                chat_id=chat_id,
+                air_signal=air_signal,
             )
 
             # 移除重复日志，已在 process_notification 中记录

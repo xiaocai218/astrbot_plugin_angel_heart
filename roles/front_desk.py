@@ -17,7 +17,7 @@ except ImportError:
 
     logger = logging.getLogger(__name__)
 from astrbot.api.event import AstrMessageEvent
-from astrbot.core.message.components import Image  # 导入 Image 和 Plain 组件
+from astrbot.core.message.components import At, Image, Reply  # 导入 Image 和显式唤醒相关组件
 from typing import Any, List, Dict  # 导入类型提示
 
 # 导入公共工具函数和 ConversationLedger
@@ -93,6 +93,27 @@ class FrontDesk:
             return internal_id
         except Exception:
             return ""
+
+    def _extract_directed_to_bot_flags(self, event: AstrMessageEvent) -> tuple[bool, str]:
+        """
+        从原始消息组件中提取“是否明确对机器人说话”的结构化信号。
+
+        Returns:
+            tuple[bool, str]: (是否明确指向机器人, 唤起来源)
+        """
+        try:
+            self_id = str(event.get_self_id())
+            for component in event.get_messages():
+                if isinstance(component, At) and str(component.qq) == self_id:
+                    return True, "at_self"
+                if isinstance(component, Reply) and str(component.sender_id) == self_id:
+                    return True, "reply_self"
+        except Exception as e:
+            logger.debug(
+                f"AngelHeart[{event.unified_msg_origin}]: 提取显式呼唤信号失败: {e}"
+            )
+
+        return False, ""
 
     async def cache_message(self, chat_id: str, event: AstrMessageEvent):
         """
@@ -180,6 +201,7 @@ class FrontDesk:
 
         # 6. 构建完整的消息字典
         source_event_id = self._get_event_message_id(event)
+        is_directed_to_bot, summon_source = self._extract_directed_to_bot_flags(event)
         new_message = {
             "role": "user",
             "content": content_list,  # 标准多模态列表
@@ -192,6 +214,9 @@ class FrontDesk:
                 if hasattr(event, "get_timestamp") and event.get_timestamp()
                 else time.time()
             ),
+            # 结构化保存显式唤起信号，避免后续仅靠 outline/别名字符串误判。
+            "is_directed_to_bot": is_directed_to_bot,
+            "summon_source": summon_source,
         }
         # 7. 检查AI是否不在场
         is_not_present = self.context.is_not_present(chat_id)
@@ -451,7 +476,7 @@ class FrontDesk:
         """处理决策结果 - 复用秘书的逻辑"""
         if decision and decision.should_reply:
             logger.info(
-                f"AngelHeart[{chat_id}]: 决策为'参与'。策略: {decision.reply_strategy}"
+                f"AngelHeart[{chat_id}]: 开始执行参与决策。策略: {decision.reply_strategy}"
             )
 
             # 图片转述处理
@@ -522,7 +547,7 @@ class FrontDesk:
 
         elif decision:
             logger.info(
-                f"AngelHeart[{chat_id}]: 决策为'不参与'。原因: {decision.reply_strategy}"
+                f"AngelHeart[{chat_id}]: 按不参与决策收尾。原因: {decision.reply_strategy}"
             )
             await self.context.clear_decision(chat_id)
             self.context.conversation_ledger.mark_as_processed(chat_id, boundary_ts)

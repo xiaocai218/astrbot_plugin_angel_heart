@@ -44,6 +44,11 @@ class ConfigManager:
         return self._config.get("analyzer_model", "")
 
     @property
+    def deputy_analyzer_model(self) -> str:
+        """副秘书模型名称，用于主秘书故障时回退"""
+        return self._config.get("deputy_analyzer_model", "")
+
+    @property
     def reply_strategy_guide(self) -> str:
         """回复策略指导文本"""
         return self._config.get("reply_strategy_guide", "")
@@ -104,6 +109,11 @@ class ConfigManager:
         return self._config.get("is_reasoning_model", False)
 
     @property
+    def deputy_is_reasoning_model(self) -> bool:
+        """副秘书是否是思维模型；默认跟随主秘书配置"""
+        return self._config.get("deputy_is_reasoning_model", self.is_reasoning_model)
+
+    @property
     def ai_self_identity(self) -> str:
         """AI的自我身份定位"""
         return self._config.get(
@@ -120,6 +130,11 @@ class ConfigManager:
     def comfort_words(self) -> str:
         """安心词列表，多个词用'|'分隔"""
         return self._config.get("comfort_words", "嗯嗯|我在|别急")
+
+    @property
+    def patience_enabled(self) -> bool:
+        """是否启用安抚机制。"""
+        return self._config.get("patience_enabled", True)
 
     # ========== 4状态机制新增配置 ==========
 
@@ -172,6 +187,16 @@ class ConfigManager:
             int: 超时时间，默认600秒（10分钟）
         """
         return self._config.get("observation_timeout", 600)
+
+    @property
+    def observation_min_messages(self) -> int:
+        """
+        观测状态下重新触发分析所需的最少未处理用户消息数
+
+        Returns:
+            int: 最少消息数，默认2条
+        """
+        return max(1, int(self._config.get("observation_min_messages", 2)))
 
     @property
     def echo_detection_window(self) -> int:
@@ -239,6 +264,59 @@ class ConfigManager:
         return self._config.get("tool_decoration_cooldown", 7.0)
 
     @property
+    def air_reading_enabled(self) -> bool:
+        """是否启用读空气预筛。"""
+        return self._config.get("air_reading_enabled", True)
+
+    @property
+    def air_reading_suppress_threshold(self) -> int:
+        """读空气压制阈值，分数低于等于该值时优先压制。"""
+        return int(self._config.get("air_reading_suppress_threshold", -2))
+
+    @property
+    def air_reading_ignore_window_messages(self) -> int:
+        """AI 被连续无视多少条用户消息后视为近期被无视。"""
+        return max(1, int(self._config.get("air_reading_ignore_window_messages", 3)))
+
+    @property
+    def air_reading_suppress_human_to_human(self) -> bool:
+        """是否压制明显的人类互聊场景。"""
+        return self._config.get("air_reading_suppress_human_to_human", True)
+
+    @property
+    def air_reading_suppress_ignored_recently(self) -> bool:
+        """是否压制近期被无视后继续主动介入。"""
+        return self._config.get("air_reading_suppress_ignored_recently", True)
+
+    @property
+    def air_reading_suppress_heated(self) -> bool:
+        """是否压制火药味/争执场景。"""
+        return self._config.get("air_reading_suppress_heated", True)
+
+    @property
+    def air_reading_suppress_smalltalk(self) -> bool:
+        """是否压制低信息量寒暄/接梗场景。"""
+        return self._config.get("air_reading_suppress_smalltalk", True)
+
+    @property
+    def air_reading_heated_keywords(self) -> list[str]:
+        """火药味关键词列表。"""
+        raw = self._config.get(
+            "air_reading_heated_keywords",
+            "傻逼|滚|闭嘴|有病|脑残|吵|骂|喷|急了|破防",
+        )
+        return [item.strip() for item in str(raw).split("|") if item.strip()]
+
+    @property
+    def air_reading_smalltalk_patterns(self) -> list[str]:
+        """低信息量寒暄/接梗关键词列表。"""
+        raw = self._config.get(
+            "air_reading_smalltalk_patterns",
+            "哈哈|呵呵|牛|6|草|行吧|确实|笑死|晚安|早|早安|哦哦|嗯嗯",
+        )
+        return [item.strip() for item in str(raw).split("|") if item.strip()]
+
+    @property
     def tool_decorations(self) -> dict:
         """工具修饰语配置字典"""
         import json
@@ -275,6 +353,7 @@ class ConfigManager:
                 "analysis_on_mention_only": self.analysis_on_mention_only,
                 "force_reply_when_summoned": self.force_reply_when_summoned,
                 "comfort_words": self.comfort_words,
+                "patience_enabled": self.patience_enabled,
                 "slap_words": self.slap_words,
                 "silence_duration": self.silence_duration,
             },
@@ -291,5 +370,14 @@ class ConfigManager:
                 "echo_detection_window": self.echo_detection_window,
                 "dense_conversation_window": self.dense_conversation_window,
                 "min_participant_count": self.min_participant_count,
+            },
+            "air_reading": {
+                "air_reading_enabled": self.air_reading_enabled,
+                "air_reading_suppress_threshold": self.air_reading_suppress_threshold,
+                "air_reading_ignore_window_messages": self.air_reading_ignore_window_messages,
+                "air_reading_suppress_human_to_human": self.air_reading_suppress_human_to_human,
+                "air_reading_suppress_ignored_recently": self.air_reading_suppress_ignored_recently,
+                "air_reading_suppress_heated": self.air_reading_suppress_heated,
+                "air_reading_suppress_smalltalk": self.air_reading_suppress_smalltalk,
             },
         }

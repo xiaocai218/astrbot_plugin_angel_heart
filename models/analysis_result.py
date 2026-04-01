@@ -6,8 +6,14 @@ class SecretaryDecision(BaseModel):
     秘书决策数据模型
     """
     should_reply: bool = Field(description="是否需要介入")
+    is_directly_addressed: bool = Field(default=False, description="是否被直接点名、@到或明确要求当前轮回应")
     is_questioned: bool = Field(default=False, description="是否被追问（用户在继续之前的话题或要求回应之前的回答）")
     is_interesting: bool = Field(default=False, description="话题是否有趣（符合AI身份、能提供价值、介入合适）")
+    air_score: int = Field(default=0, description="本地读空气评分，范围 -10 到 10")
+    should_suppress: bool = Field(default=False, description="读空气压制器是否建议压制本轮主动介入")
+    suppression_reason: str = Field(default="", description="读空气压制原因")
+    conversation_mode: str = Field(default="", description="当前会话氛围类型")
+    engagement_hint: str = Field(default="", description="最近一次 AI 介入后的反馈")
     reply_strategy: str = Field(description="概述你计划采用的策略。如果 should_reply 为 false，此项应为 '继续观察'")
     topic: str = Field(description="对当前唯一核心话题的简要概括")
     reply_target: str = Field(default="", description="回复目标用户的昵称或ID。如果不需要回复，此项应为空字符串")

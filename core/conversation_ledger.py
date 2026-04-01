@@ -578,7 +578,7 @@ class ConversationLedger:
 
     def _prune_to_essentials(self, chat_id: str):
         """
-        精简会话消息，仅保留最新的7条非工具消息
+        精简会话消息，仅保留满足状态判断所需的最小非工具消息数量
 
         Args:
             chat_id: 会话ID
@@ -596,18 +596,26 @@ class ConversationLedger:
                 if not is_tool and not has_tool_calls:
                     non_tool_messages.append(msg)
 
-            # 3. 如果非工具消息数量大于7，则只保留时间戳最新的7条
-            if len(non_tool_messages) > 7:
+            retain_count = max(
+                self.MIN_RETAIN_COUNT,
+                int(self.config_manager.dense_conversation_threshold),
+                int(self.config_manager.echo_detection_threshold),
+            )
+
+            # 3. 如果非工具消息数量超过保留上限，则只保留时间戳最新的一批
+            if len(non_tool_messages) > retain_count:
                 # 按时间戳降序排序（最新的在前）
                 non_tool_messages.sort(key=lambda m: m.get("timestamp", 0), reverse=True)
-                # 只保留最新的7条
-                essential_messages = non_tool_messages[:7]
+                # 只保留最新的 retain_count 条
+                essential_messages = non_tool_messages[:retain_count]
                 # 按时间戳升序排序（恢复原始顺序）
                 essential_messages.sort(key=lambda m: m.get("timestamp", 0))
 
                 # 4. 用这批"精华消息"完全替换内存中该会话的整个消息列表
                 ledger["messages"] = essential_messages
-                logger.info(f"AngelHeart[{chat_id}]: 已精简会话消息，保留最新的7条非工具消息")
+                logger.info(
+                    f"AngelHeart[{chat_id}]: 已精简会话消息，保留最新的{retain_count}条非工具消息"
+                )
 
     def _estimate_tokens(self, chat_id: str) -> int:
         """

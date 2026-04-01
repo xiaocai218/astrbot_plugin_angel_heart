@@ -426,6 +426,10 @@ class AngelHeartContext:
             )
     async def start_patience_timer(self, chat_id: str):
         """启动或重置指定来访者的安抚机制"""
+        if not self.config_manager.patience_enabled:
+            logger.info(f"AngelHeart[{chat_id}]: 安抚机制已关闭，跳过启动")
+            return
+
         # 先停止之前的安抚
         await self.cancel_patience_timer(chat_id)
 

@@ -3,6 +3,7 @@ AngelHeart 插件 - 上下文处理相关工具函数
 """
 
 import json
+from xml.sax.saxutils import escape
 from typing import List, Dict, TYPE_CHECKING, Union, Tuple
 
 if TYPE_CHECKING:
@@ -207,9 +208,9 @@ def format_decision_xml(decision: 'SecretaryDecision') -> str:
     Returns:
         str: 系统决策 XML 字符串
     """
-    topic = decision.topic
-    target = decision.reply_target
-    strategy = decision.reply_strategy
+    topic = escape(str(decision.topic or ""))
+    target = escape(str(decision.reply_target or ""))
+    strategy = escape(str(decision.reply_strategy or ""))
 
     decision_xml = f"""<系统决策>
 <系统提醒>该决策是系统简单分析之后的建议方向，你可以参考，但是仍以用户对话为优先</系统提醒>

@@ -176,6 +176,10 @@ class StatusChecker:
             if not latest_user_message:
                 return False
 
+            # 优先使用结构化信号，避免依赖 outline 中是否展开了 @昵称。
+            if latest_user_message.get("is_directed_to_bot"):
+                return True
+
             message_content = self._extract_message_content(latest_user_message)
             return self._detect_wake_word(chat_id, message_content)
         except Exception as e:
@@ -305,23 +309,30 @@ class StatusChecker:
             participant_set = set()
 
             for msg in all_messages:
+                if msg.get("role") != "user":
+                    continue
                 if msg.get("timestamp", 0) > cutoff_time:
                     message_count += 1
                     participant_set.add(msg.get("sender_id", ""))
 
-            # 早期退出优化
-            if message_count < message_threshold:
-                return False
-
             participant_count = len(participant_set)
-            is_dense = participant_count >= participant_threshold
+            meets_message_threshold = message_count >= message_threshold
+            meets_participant_threshold = participant_count >= participant_threshold
+            is_dense = meets_message_threshold and meets_participant_threshold
 
-            if is_dense:
-                logger.debug(
-                    f"AngelHeart[{chat_id}]: 密集发言检测 - "
-                    f"消息数: {message_count}/{message_threshold}, "
+            if not meets_message_threshold:
+                logger.info(
+                    f"AngelHeart[{chat_id}]: 密集发言未命中，消息数不足。"
+                    f"消息数: {message_count}/{message_threshold}，"
                     f"参与人数: {participant_count}/{participant_threshold}"
                 )
+                return False
+
+            logger.info(
+                f"AngelHeart[{chat_id}]: 密集发言检测结果: {'命中' if is_dense else '未命中'}。"
+                f"消息数: {message_count}/{message_threshold}，"
+                f"参与人数: {participant_count}/{participant_threshold}"
+            )
 
             return is_dense
 

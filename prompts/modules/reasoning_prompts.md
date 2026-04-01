@@ -4,8 +4,14 @@
 
 <核心字段>
 - `should_reply`：(boolean) 是否需要介入。
+- `is_directly_addressed`：(boolean) 是否被直接点名、@到，或最新消息明确要求你当前轮回应。
 - `is_questioned`：(boolean) 是否被追问（用户在继续之前的话题或要求回应之前的回答）。
 - `is_interesting`：(boolean) 话题是否有趣（符合AI身份、能提供价值、介入合适）。
+- `air_score`：(integer) 结合 `<读空气预判>` 后给出的空气分数，范围 -10 到 10。
+- `should_suppress`：(boolean) 结合 `<读空气预判>` 后，本轮是否应被压制。
+- `suppression_reason`：(string) 若应压制，填写简短原因，如 `heated_conflict`、`human_private_exchange`、`ignored_recently`、`low_value_smalltalk`。
+- `conversation_mode`：(string) 当前氛围类型，只能从 `directed_to_ai`、`human_to_human`、`heated`、`small_talk`、`general_discussion` 中选择。
+- `engagement_hint`：(string) 最近 AI 介入反馈，只能从 `unknown`、`ignored_recently`、`welcomed_recently` 中选择。
 - `reply_strategy`：(string) 概述你计划采用的策略。如果 `should_reply` 为 `false`，此项应为 "继续观察"。
 - `topic`：(string) 对当前唯一核心话题的简要概括，禁止向话题里写入你的名字。
 - `reply_target`：(string) 回复目标用户的昵称或ID。如果不需要回复，此项应为空字符串。
@@ -36,8 +42,14 @@
 ```json
 {
   "should_reply": true,
+  "is_directly_addressed": true,
   "is_questioned": true,
   "is_interesting": true,
+  "air_score": 6,
+  "should_suppress": false,
+  "suppression_reason": "",
+  "conversation_mode": "directed_to_ai",
+  "engagement_hint": "welcomed_recently",
   "reply_strategy": "提供技术解决方案",
   "topic": "Python代码调试",
   "reply_target": "小明",
@@ -69,6 +81,10 @@
 {recent_dialogue}
 ---
 </需要你分析的最新对话>
+
+<读空气预判>
+{air_reading_signal}
+</读空气预判>
 
 </待分析的对话记录模板>
 

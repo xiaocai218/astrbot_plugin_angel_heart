@@ -2,6 +2,8 @@ import asyncio
 from typing import List, Dict
 import json
 import string
+import re
+from dataclasses import dataclass
 
 try:
     from astrbot.api import logger
@@ -11,6 +13,7 @@ except ImportError:
 from ..core.utils import JsonParser, format_message_for_llm
 from ..models.analysis_result import SecretaryDecision
 from .prompt_module_loader import PromptModuleLoader
+from .air_reading import AirReadingSignal
 
 
 class SafeFormatter(string.Formatter):
@@ -48,6 +51,15 @@ class SafeFormatter(string.Formatter):
             return string.Formatter.get_value(key, args, kwargs)
 
 
+@dataclass
+class AnalyzerModelCandidate:
+    """分析模型候选配置。"""
+
+    model_name: str
+    is_reasoning_model: bool
+    role_label: str
+
+
 class LLMAnalyzer:
     """
     LLM分析器 - 执行实时分析和标注
@@ -58,6 +70,16 @@ class LLMAnalyzer:
 
     # 类级别的常量
     MAX_CONVERSATION_LENGTH = 50
+    MAX_TEXT_FIELD_LENGTH = 120
+    MAX_LIST_ITEMS = 8
+    MAX_LIST_ITEM_LENGTH = 40
+    DEFAULT_AIR_READING_PROMPT = (
+        "- air_score: 0\n"
+        "- should_suppress: false\n"
+        "- suppression_reason: none\n"
+        "- conversation_mode: general_discussion\n"
+        "- engagement_hint: unknown\n"
+    )
 
     def __init__(
         self,
@@ -71,6 +93,7 @@ class LLMAnalyzer:
         self.strategy_guide = strategy_guide or ""  # 存储策略指导文本
         self.config_manager = config_manager  # 存储 config_manager 对象，用于访问配置
         self.is_ready = False  # 默认认为分析器未就绪
+        self._prompt_template_cache: Dict[bool, str] = {}
 
         # 初始化提示词模块加载器
         self.prompt_loader = PromptModuleLoader()
@@ -83,6 +106,7 @@ class LLMAnalyzer:
             # 使用 PromptModuleLoader 构建提示词模板
             is_reasoning_model = config_manager.is_reasoning_model if config_manager else False
             self.base_prompt_template = self.prompt_loader.build_prompt_template(is_reasoning_model)
+            self._prompt_template_cache[is_reasoning_model] = self.base_prompt_template
 
             if self.base_prompt_template:
                 self.is_ready = True
@@ -107,6 +131,7 @@ class LLMAnalyzer:
             self.prompt_loader.reload_modules()
             is_reasoning_model = new_config_manager.is_reasoning_model if new_config_manager else False
             self.base_prompt_template = self.prompt_loader.build_prompt_template(is_reasoning_model)
+            self._prompt_template_cache = {is_reasoning_model: self.base_prompt_template}
 
             if self.base_prompt_template:
                 self.is_ready = True
@@ -119,20 +144,17 @@ class LLMAnalyzer:
             self.is_ready = False
             logger.error(f"AngelHeart分析器: Prompt模板重新加载时发生错误: {e}")
 
-    def _parse_response(self, response_text: str, alias: str) -> SecretaryDecision:
-        """
-        解析AI模型的响应文本并返回SecretaryDecision对象
+    def _get_prompt_template(self, is_reasoning_model: bool) -> str:
+        """按模型类型获取提示词模板，并做简单缓存。"""
+        cached = self._prompt_template_cache.get(is_reasoning_model)
+        if cached:
+            return cached
 
-        Args:
-            response_text (str): AI模型的响应文本
-            alias (str): AI的昵称
+        template = self.prompt_loader.build_prompt_template(is_reasoning_model)
+        self._prompt_template_cache[is_reasoning_model] = template
+        return template
 
-        Returns:
-            SecretaryDecision: 解析后的决策对象
-        """
-        return self._parse_and_validate_decision(response_text, alias)
-
-    async def _call_ai_model(self, prompt: str, chat_id: str) -> str:
+    async def _call_ai_model(self, prompt: str, chat_id: str, model_name: str) -> str:
         """
         调用AI模型并返回响应文本，包含3秒后自动重试1次机制
         """
@@ -145,10 +167,10 @@ class LLMAnalyzer:
             logger.info("----------------------------------------")
 
         # 动态获取 provider
-        provider = self.context.get_provider_by_id(self.analyzer_model_name)
+        provider = self.context.get_provider_by_id(model_name)
         if not provider:
             logger.warning(
-                f"AngelHeart分析器: 未找到名为 '{self.analyzer_model_name}' 的分析模型提供商。"
+                f"AngelHeart分析器: 未找到名为 '{model_name}' 的分析模型提供商。"
             )
             raise Exception("未找到分析模型提供商")
 
@@ -178,13 +200,17 @@ class LLMAnalyzer:
                     await asyncio.sleep(retry_delay)
                 else:
                     logger.error(
-                        f"💥 AngelHeart分析器: 调用AI模型失败，已重试{max_retries}次: {e}",
+                        f"💥 AngelHeart分析器: 调用AI模型失败(model={model_name})，已重试{max_retries}次: {e}",
                         exc_info=True,
                     )
                     raise
 
     def _build_prompt(
-        self, historical_context: List[Dict], recent_dialogue: List[Dict]
+        self,
+        historical_context: List[Dict],
+        recent_dialogue: List[Dict],
+        air_signal: AirReadingSignal | None = None,
+        is_reasoning_model: bool | None = None,
     ) -> str:
         """
         使用给定的对话历史构建分析提示词
@@ -201,6 +227,9 @@ class LLMAnalyzer:
 
         historical_text = f"<已回应消息>\n{historical_body}\n</已回应消息>" if historical_body else " "
         recent_text = f"<未回应消息>\n{recent_body}\n</未回应消息>" if recent_body else " "
+        air_reading_text = (
+            air_signal.to_prompt_block() if air_signal else self.DEFAULT_AIR_READING_PROMPT
+        )
 
         # 增强检查：如果历史文本为空，则记录警告日志
         if not historical_text and not recent_text:
@@ -212,11 +241,15 @@ class LLMAnalyzer:
         alias = self.config_manager.alias if self.config_manager else "AngelHeart"
 
         # 使用直接的字符串替换来构建提示词，规避.format()方法对特殊字符的解析问题
-        base_prompt = self.base_prompt_template
+        if is_reasoning_model is None:
+            is_reasoning_model = self.config_manager.is_reasoning_model if self.config_manager else False
+
+        base_prompt = self._get_prompt_template(is_reasoning_model)
         base_prompt = base_prompt.replace("{historical_context}", historical_text)
         base_prompt = base_prompt.replace("{recent_dialogue}", recent_text)
         base_prompt = base_prompt.replace("{reply_strategy_guide}", self.strategy_guide)
         base_prompt = base_prompt.replace("{alias}", alias)
+        base_prompt = base_prompt.replace("{air_reading_signal}", air_reading_text)
         base_prompt = base_prompt.replace(
             "{ai_self_identity}",
             self.config_manager.ai_self_identity if self.config_manager else "",
@@ -224,8 +257,69 @@ class LLMAnalyzer:
 
         return base_prompt
 
+    def _build_model_candidates(self) -> List[AnalyzerModelCandidate]:
+        """构建主秘书/副秘书候选列表。"""
+        candidates: List[AnalyzerModelCandidate] = []
+
+        if self.analyzer_model_name:
+            candidates.append(
+                AnalyzerModelCandidate(
+                    model_name=self.analyzer_model_name,
+                    is_reasoning_model=self.config_manager.is_reasoning_model if self.config_manager else False,
+                    role_label="主秘书",
+                )
+            )
+
+        deputy_model = self.config_manager.deputy_analyzer_model if self.config_manager else ""
+        if deputy_model and deputy_model != self.analyzer_model_name:
+            candidates.append(
+                AnalyzerModelCandidate(
+                    model_name=deputy_model,
+                    is_reasoning_model=self.config_manager.deputy_is_reasoning_model if self.config_manager else False,
+                    role_label="副秘书",
+                )
+            )
+
+        return candidates
+
+    def _should_try_next_candidate(self, error: Exception) -> bool:
+        """仅在基础设施故障时回退到副秘书。"""
+        if isinstance(error, asyncio.TimeoutError):
+            return True
+
+        message = str(error).lower()
+        failure_markers = (
+            "429",
+            "rate limit",
+            "too many requests",
+            "resource_exhausted",
+            "quota exceeded",
+            "quota",
+            "timeout",
+            "timed out",
+            "unavailable",
+            "overload",
+            "overloaded",
+            "connection",
+            "network",
+            "refused",
+            "reset",
+            "not found",
+            "未找到分析模型提供商",
+            "不可用",
+            "超时",
+            "限流",
+            "限速",
+            "速率限制",
+        )
+        return any(marker in message for marker in failure_markers)
+
     async def analyze_and_decide(
-        self, historical_context: List[Dict], recent_dialogue: List[Dict], chat_id: str
+        self,
+        historical_context: List[Dict],
+        recent_dialogue: List[Dict],
+        chat_id: str,
+        air_signal: AirReadingSignal | None = None,
     ) -> SecretaryDecision:
         """
         分析对话历史，做出结构化的决策 (JSON)
@@ -250,54 +344,104 @@ class LLMAnalyzer:
                 entities=[], facts=[], keywords=[]
             )
 
-        # 1. 调用轻量级AI进行分析
-        logger.debug("AngelHeart分析器: 准备调用轻量级AI进行分析...")
-        prompt = self._build_prompt(historical_context, recent_dialogue)
-
-        # 2. 增强检查：如果生成的提示词为空，则记录警告日志并返回一个明确的决策
-        if not prompt:
-            logger.warning(
-                "AngelHeart分析器: 生成的分析提示词为空，将返回'分析内容为空'的决策。"
-            )
+        model_candidates = self._build_model_candidates()
+        if not model_candidates:
+            logger.debug("AngelHeart分析器: 主秘书和副秘书模型均未配置。")
             return SecretaryDecision(
-                should_reply=False,
-                reply_strategy="分析内容为空",
-                topic="未知",
+                should_reply=False, reply_strategy="未配置", topic="未知",
                 entities=[], facts=[], keywords=[]
             )
 
-        response_text = ""
-        try:
-            response_text = await self._call_ai_model(prompt, chat_id)
-            # 调用新方法解析和验证响应，并传递 alias
-            return self._parse_response(response_text, alias)
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(
-                f"AngelHeart分析器: AI返回的JSON格式或内容有误: {e}. 原始响应: {response_text[:200]}..."
+        last_error: Exception | None = None
+        for index, candidate in enumerate(model_candidates):
+            logger.debug(
+                f"AngelHeart分析器: 准备调用{candidate.role_label}模型 '{candidate.model_name}' 进行分析..."
             )
-        except asyncio.CancelledError:
-            # 重新抛出 CancelledError，以确保异步任务可以被正常取消
-            raise
-        except Exception as e:
-            logger.error(
-                f"💥 AngelHeart分析器: 轻量级AI分析失败: {e}",
-                exc_info=True,
+            prompt = self._build_prompt(
+                historical_context,
+                recent_dialogue,
+                air_signal=air_signal,
+                is_reasoning_model=candidate.is_reasoning_model,
             )
 
+            if not prompt:
+                logger.warning(
+                    f"AngelHeart分析器: 为{candidate.role_label}生成的分析提示词为空，将跳过该模型。"
+                )
+                continue
+
+            response_text = ""
+            try:
+                response_text = await self._call_ai_model(prompt, chat_id, candidate.model_name)
+                return self._parse_response(response_text, alias, air_signal=air_signal)
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.warning(
+                    f"AngelHeart分析器: {candidate.role_label}返回的JSON格式或内容有误: {e}. 原始响应: {response_text[:200]}..."
+                )
+                last_error = e
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                last_error = e
+                has_next_candidate = index < len(model_candidates) - 1
+                if has_next_candidate and self._should_try_next_candidate(e):
+                    next_candidate = model_candidates[index + 1]
+                    logger.warning(
+                        f"AngelHeart分析器: {candidate.role_label}模型 '{candidate.model_name}' 调用失败 ({e})，切换到{next_candidate.role_label}模型 '{next_candidate.model_name}'。"
+                    )
+                    continue
+
+                logger.error(
+                    f"💥 AngelHeart分析器: {candidate.role_label}分析失败: {e}",
+                    exc_info=True,
+                )
+                break
+
         # 如果发生任何错误，都返回一个默认的不参与决策
+        if last_error:
+            logger.warning(f"AngelHeart分析器: 主秘书/副秘书链路最终失败，回退为不回复。错误: {last_error}")
         return SecretaryDecision(
             should_reply=False, reply_strategy="分析失败", topic="未知",
             entities=[], facts=[], keywords=[]
         )
 
+    def _parse_response(
+        self,
+        response_text: str,
+        alias: str,
+        air_signal: AirReadingSignal | None = None,
+    ) -> SecretaryDecision:
+        """
+        解析AI模型的响应文本并返回SecretaryDecision对象
+
+        Args:
+            response_text (str): AI模型的响应文本
+            alias (str): AI的昵称
+            air_signal (AirReadingSignal | None): 本地读空气信号
+
+        Returns:
+            SecretaryDecision: 解析后的决策对象
+        """
+        return self._parse_and_validate_decision(response_text, alias, air_signal=air_signal)
+
     def _parse_and_validate_decision(
-        self, response_text: str, alias: str
+        self, response_text: str, alias: str, air_signal: AirReadingSignal | None = None
     ) -> SecretaryDecision:
         """解析并验证来自AI的响应文本，构建SecretaryDecision对象"""
 
         # 定义SecretaryDecision的字段要求
         required_fields = ["should_reply", "reply_strategy", "topic", "reply_target", "entities", "facts", "keywords"]
-        optional_fields = ["is_questioned", "is_interesting"]
+        optional_fields = [
+            "is_directly_addressed",
+            "is_questioned",
+            "is_interesting",
+            "air_score",
+            "should_suppress",
+            "suppression_reason",
+            "conversation_mode",
+            "engagement_hint",
+        ]
 
         # 使用JsonParser提取JSON数据
         try:
@@ -327,66 +471,43 @@ class LLMAnalyzer:
 
         # 对来自 AI 的 JSON 做健壮性处理，防止字段为 null 或类型不符合导致 pydantic 校验失败
         raw = decision_data
-        # 解析 should_reply，兼容 bool、数字、字符串等形式
-        should_reply_raw = raw.get("should_reply", False)
-        if isinstance(should_reply_raw, bool):
-            should_reply = should_reply_raw
-        elif isinstance(should_reply_raw, (int, float)):
-            should_reply = bool(should_reply_raw)
-        elif isinstance(should_reply_raw, str):
-            should_reply = should_reply_raw.lower() in ("true", "1", "yes", "是", "对")
-        else:
-            should_reply = False
+        should_reply = self._normalize_bool(raw.get("should_reply", False))
+        is_directly_addressed = self._normalize_bool(raw.get("is_directly_addressed", False))
+        is_questioned = self._normalize_bool(raw.get("is_questioned", False))
+        is_interesting = self._normalize_bool(raw.get("is_interesting", False))
+        air_score = self._normalize_int(raw.get("air_score", 0), 0, -10, 10)
+        should_suppress = self._normalize_bool(raw.get("should_suppress", False))
+        suppression_reason = self._normalize_text_field(raw.get("suppression_reason"), "")
+        conversation_mode = self._normalize_enum_text(
+            raw.get("conversation_mode"),
+            {"directed_to_ai", "human_to_human", "heated", "small_talk", "general_discussion"},
+            "general_discussion",
+        )
+        engagement_hint = self._normalize_enum_text(
+            raw.get("engagement_hint"),
+            {"unknown", "ignored_recently", "welcomed_recently"},
+            "unknown",
+        )
 
-        # 解析 is_questioned
-        is_questioned_raw = raw.get("is_questioned", False)
-        if isinstance(is_questioned_raw, bool):
-            is_questioned = is_questioned_raw
-        elif isinstance(is_questioned_raw, (int, float)):
-            is_questioned = bool(is_questioned_raw)
-        elif isinstance(is_questioned_raw, str):
-            is_questioned = is_questioned_raw.lower() in (
-                "true",
-                "1",
-                "yes",
-                "是",
-                "对",
-            )
-        else:
-            is_questioned = False
+        reply_strategy = self._normalize_text_field(raw.get("reply_strategy"), "未知策略")
+        topic = self._normalize_text_field(raw.get("topic"), "未知话题")
+        reply_target = self._normalize_text_field(raw.get("reply_target"), "")
 
-        # 解析 is_interesting
-        is_interesting_raw = raw.get("is_interesting", False)
-        if isinstance(is_interesting_raw, bool):
-            is_interesting = is_interesting_raw
-        elif isinstance(is_interesting_raw, (int, float)):
-            is_interesting = bool(is_interesting_raw)
-        elif isinstance(is_interesting_raw, str):
-            is_interesting = is_interesting_raw.lower() in (
-                "true",
-                "1",
-                "yes",
-                "是",
-                "对",
-            )
-        else:
-            is_interesting = False
-
-        # 提取其他字段
-        reply_strategy = str(raw.get("reply_strategy") or "未知策略")
-        topic = str(raw.get("topic") or "未知话题")
-        reply_target = str(raw.get("reply_target") or "")
-
-        # 提取新增的RAG字段
-        entities = raw.get("entities", [])
-        facts = raw.get("facts", [])
-        keywords = raw.get("keywords", [])
+        entities = self._normalize_string_list(raw.get("entities", []))
+        facts = self._normalize_string_list(raw.get("facts", []))
+        keywords = self._normalize_string_list(raw.get("keywords", []))
 
         # 创建决策对象
         decision = SecretaryDecision(
             should_reply=should_reply,
+            is_directly_addressed=is_directly_addressed,
             is_questioned=is_questioned,
             is_interesting=is_interesting,
+            air_score=air_score,
+            should_suppress=should_suppress,
+            suppression_reason=suppression_reason,
+            conversation_mode=conversation_mode,
+            engagement_hint=engagement_hint,
             reply_strategy=reply_strategy,
             topic=topic,
             reply_target=reply_target,
@@ -395,9 +516,17 @@ class LLMAnalyzer:
             keywords=keywords,
         )
 
+        if air_signal:
+            decision.air_score = air_signal.air_score
+            decision.should_suppress = air_signal.should_suppress
+            decision.suppression_reason = air_signal.suppression_reason
+            decision.conversation_mode = air_signal.conversation_mode
+            decision.engagement_hint = air_signal.engagement_hint
+
         # 代码校验和修正逻辑
         if (
             decision.should_reply
+            and not decision.is_directly_addressed
             and not decision.is_questioned
             and not decision.is_interesting
         ):
@@ -407,7 +536,88 @@ class LLMAnalyzer:
             decision.should_reply = False
             decision.reply_strategy = "继续观察"
 
+        if (
+            decision.should_reply
+            and decision.should_suppress
+            and not decision.is_directly_addressed
+            and not decision.is_questioned
+        ):
+            logger.info(
+                f"AngelHeart分析器: 读空气压制，拦截秘书参与。"
+                f"score={decision.air_score} mode={decision.conversation_mode} "
+                f"reason={decision.suppression_reason or 'continue_observing'}"
+            )
+            decision.should_reply = False
+            decision.reply_strategy = decision.suppression_reason or "继续观察"
+
         return decision
+
+    def _normalize_int(self, value: object, default: int, min_value: int, max_value: int) -> int:
+        """规范化整数并限制范围。"""
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(min_value, min(max_value, normalized))
+
+    def _normalize_enum_text(self, value: object, allowed: set[str], default: str) -> str:
+        """规范化枚举样式文本字段。"""
+        normalized = self._normalize_text_field(value, default)
+        return normalized if normalized in allowed else default
+
+    def _normalize_bool(self, value: object) -> bool:
+        """仅接受明确的布尔字面量，避免数值型脏数据误入。"""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ("true", "yes", "是", "对"):
+                return True
+            if normalized in ("false", "no", "否", "不", ""):
+                return False
+        return False
+
+    def _normalize_text_field(self, value: object, default: str) -> str:
+        """规范化文本字段，去控制字符并限制长度。"""
+        if value is None:
+            return default
+
+        text = str(value).strip()
+        if not text:
+            return default
+
+        text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > self.MAX_TEXT_FIELD_LENGTH:
+            text = text[: self.MAX_TEXT_FIELD_LENGTH].rstrip()
+        return text or default
+
+    def _normalize_string_list(self, value: object) -> List[str]:
+        """仅保留字符串项，并限制条数与单项长度。"""
+        if not isinstance(value, list):
+            if isinstance(value, str) and value.strip():
+                value = [value]
+            else:
+                return []
+
+        normalized_items: List[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                continue
+
+            cleaned = re.sub(r"[\x00-\x1f\x7f]+", " ", item)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            if not cleaned:
+                continue
+
+            if len(cleaned) > self.MAX_LIST_ITEM_LENGTH:
+                cleaned = cleaned[: self.MAX_LIST_ITEM_LENGTH].rstrip()
+
+            normalized_items.append(cleaned)
+            if len(normalized_items) >= self.MAX_LIST_ITEMS:
+                break
+
+        return normalized_items
 
     def _format_conversation_history(self, conversations: List[Dict]) -> str:
         """
