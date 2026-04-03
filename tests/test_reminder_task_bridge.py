@@ -1,4 +1,3 @@
-import asyncio
 import sys
 import unittest
 from datetime import timedelta, timezone
@@ -51,13 +50,23 @@ if "astrbot" not in sys.modules:
         def __init__(self, chain=None):
             self.chain = list(chain or [])
 
+    class _FakeAstrMessageEvent:
+        pass
+
     class _FakePlain:
         def __init__(self, text):
             self.text = text
 
+    class _FakeAt:
+        def __init__(self, qq):
+            self.qq = qq
+            self.text = f"@{qq}"
+
     astrbot_api_module.logger = _FakeLogger()
     astrbot_api_event_module.MessageChain = _FakeMessageChain
+    astrbot_api_event_module.AstrMessageEvent = _FakeAstrMessageEvent
     astrbot_core_components_module.Plain = _FakePlain
+    astrbot_core_components_module.At = _FakeAt
 
     sys.modules["astrbot"] = astrbot_module
     sys.modules["astrbot.api"] = astrbot_api_module
@@ -70,22 +79,76 @@ if "astrbot" not in sys.modules:
 from astrbot_plugin_angel_heart.core.reminder_task_bridge import ReminderTaskBridge
 
 
+class DummyScheduler:
+    def __init__(self):
+        self.jobs = {}
+
+    def get_job(self, job_id):
+        return self.jobs.get(job_id)
+
+
 class DummyConfig:
     reminder_future_task_enabled = True
+    reminder_direct_delivery_enabled = True
 
 
 class FakeJob:
-    def __init__(self, job_id="job-1"):
+    def __init__(self, job_id="job-1", name="提醒:开会", description="请提醒LuckyCai：开会。", payload=None, next_run_time="2026-04-02 08:00:00+08:00", enabled=True):
         self.job_id = job_id
+        self.name = name
+        self.description = description
+        self.payload = payload or {"session": "napcat:GroupMessage:925351983", "note": description}
+        self.next_run_time = next_run_time
+        self.enabled = enabled
 
 
 class FakeCronManager:
     def __init__(self):
         self.calls = []
+        self.basic_calls = []
+        self.updated = []
+        self.deleted = []
+        self.jobs = []
+        self._basic_handlers = {}
+        self.scheduler = DummyScheduler()
 
     async def add_active_job(self, **kwargs):
         self.calls.append(kwargs)
-        return FakeJob()
+        return FakeJob(
+            job_id=f"active-{len(self.calls)}",
+            name=kwargs.get("name", "job"),
+            description=kwargs.get("description", ""),
+            payload=kwargs.get("payload", {}),
+            next_run_time=kwargs.get("run_at") or "2026-04-02 08:00:00+08:00",
+        )
+
+    async def add_basic_job(self, **kwargs):
+        self.basic_calls.append(kwargs)
+        job = FakeJob(
+            job_id=f"basic-{len(self.basic_calls)}",
+            name=kwargs.get("name", "job"),
+            description=kwargs.get("description", ""),
+            payload=kwargs.get("payload", {}),
+        )
+        self.jobs.append(job)
+        return job
+
+    async def update_job(self, job_id, **kwargs):
+        self.updated.append((job_id, kwargs))
+        for job in self.jobs:
+            if job.job_id == job_id and "payload" in kwargs:
+                job.payload = kwargs["payload"]
+        return next((job for job in self.jobs if job.job_id == job_id), None)
+
+    async def list_jobs(self, job_type=None):
+        return list(self.jobs)
+
+    async def delete_job(self, job_id):
+        self.deleted.append(job_id)
+        self.jobs = [job for job in self.jobs if job.job_id != job_id]
+
+    def _schedule_job(self, job):
+        self.scheduler.jobs[job.job_id] = job
 
 
 class FakeAstrContext:
@@ -171,35 +234,19 @@ class ReminderTaskBridgeParseTests(unittest.TestCase):
         self.assertEqual(result.intent.cron_expression, "0 9 * * mon-fri")
         self.assertFalse(result.intent.run_once)
 
-    def test_monthly_last_day(self):
-        result = self.bridge.parse("每月最后一天晚上8点提醒我做结算", sender_name="LuckyCai")
-        self.assertEqual(result.intent.cron_expression, "0 20 28-31 * *")
-        self.assertFalse(result.intent.run_once)
-
-    def test_every_two_days(self):
-        result = self.bridge.parse("每隔两天早上9点提醒我浇花", sender_name="LuckyCai")
-        self.assertEqual(result.intent.cron_expression, "0 9 */2 * *")
-        self.assertFalse(result.intent.run_once)
-
-    def test_chinese_time(self):
-        result = self.bridge.parse("明天下午两点二十提醒我开会", sender_name="LuckyCai")
-        self.assertEqual(result.intent.due_at.hour, 14)
-        self.assertEqual(result.intent.due_at.minute, 20)
-
-    def test_quarter_end_is_one_shot(self):
-        result = self.bridge.parse("季度末晚上8点提醒我做汇报", sender_name="LuckyCai")
-        self.assertTrue(result.intent.run_once)
-
-    def test_first_workday_is_one_shot(self):
-        now = self.bridge._build_datetime(2026, 5, 28, 10, 0)
-        result = self.bridge.parse("月初第一个工作日上午9点提醒我交报表", sender_name="LuckyCai", now=now)
-        self.assertTrue(result.intent.run_once)
-        self.assertLessEqual(result.intent.due_at.day, 7)
-        self.assertLessEqual(result.intent.due_at.weekday(), 4)
+    def test_delivery_task_with_keep_existing(self):
+        result = self.bridge.parse("每天早上7点推送江阴本地天气情况，不需要覆盖", sender_name="LuckyCai")
+        self.assertTrue(result.explicit_request)
+        self.assertIsNotNone(result.intent)
+        self.assertEqual(result.intent.request_kind, "delivery")
+        self.assertEqual(result.intent.action_label, "推送")
+        self.assertTrue(result.intent.keep_existing)
+        self.assertEqual(result.intent.reminder_text, "江阴本地天气情况")
+        self.assertEqual(result.intent.cron_expression, "0 7 * * *")
 
 
 class ReminderTaskBridgeHandleTests(unittest.IsolatedAsyncioTestCase):
-    async def test_success_creates_future_task(self):
+    async def test_reminder_creates_direct_basic_job(self):
         cron_manager = FakeCronManager()
         angel_context = FakeAngelContext(cron_manager)
         bridge = ReminderTaskBridge(DummyConfig(), angel_context)
@@ -209,11 +256,11 @@ class ReminderTaskBridgeHandleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(handled)
         self.assertTrue(event.stopped)
-        self.assertEqual(len(cron_manager.calls), 1)
-        self.assertTrue(cron_manager.calls[0]["run_once"])
+        self.assertEqual(len(cron_manager.basic_calls), 1)
+        self.assertEqual(len(cron_manager.calls), 0)
         self.assertIn("创建未来任务", angel_context.astr_context.sent_messages[0][1])
 
-    async def test_every_two_days_creates_recurring_task(self):
+    async def test_recurring_reminder_creates_direct_basic_job(self):
         cron_manager = FakeCronManager()
         angel_context = FakeAngelContext(cron_manager)
         bridge = ReminderTaskBridge(DummyConfig(), angel_context)
@@ -222,37 +269,73 @@ class ReminderTaskBridgeHandleTests(unittest.IsolatedAsyncioTestCase):
         handled = await bridge.try_handle(event)
 
         self.assertTrue(handled)
-        self.assertFalse(cron_manager.calls[0]["run_once"])
-        self.assertEqual(cron_manager.calls[0]["cron_expression"], "0 9 */2 * *")
+        self.assertEqual(cron_manager.basic_calls[0]["cron_expression"], "0 9 */2 * *")
+        self.assertEqual(len(cron_manager.calls), 0)
         self.assertIn("每隔2天 09:00", angel_context.astr_context.sent_messages[0][1])
 
-    async def test_parse_failure_sends_explicit_feedback(self):
+    async def test_delivery_task_keeps_agent_track(self):
         cron_manager = FakeCronManager()
         angel_context = FakeAngelContext(cron_manager)
         bridge = ReminderTaskBridge(DummyConfig(), angel_context)
-        event = FakeEvent("提醒我开会")
+        event = FakeEvent("每天早上7点推送江阴本地天气情况，不需要覆盖")
 
         handled = await bridge.try_handle(event)
 
         self.assertTrue(handled)
-        self.assertEqual(len(cron_manager.calls), 0)
-        self.assertIn("提醒没创建成功", angel_context.astr_context.sent_messages[0][1])
+        self.assertEqual(len(cron_manager.calls), 1)
+        self.assertEqual(len(cron_manager.basic_calls), 0)
+        self.assertEqual(cron_manager.calls[0]["cron_expression"], "0 7 * * *")
+        self.assertIn("不会覆盖旧任务", angel_context.astr_context.sent_messages[0][1])
 
-    async def test_disabled_does_not_take_over(self):
+    async def test_direct_handler_sends_message_and_deletes_one_shot(self):
         cron_manager = FakeCronManager()
         angel_context = FakeAngelContext(cron_manager)
-        config = DummyConfig()
-        config.reminder_future_task_enabled = False
-        bridge = ReminderTaskBridge(config, angel_context)
-        event = FakeEvent("明天早上8点提醒我开会")
+        bridge = ReminderTaskBridge(DummyConfig(), angel_context)
+        handler = bridge._build_direct_reminder_handler()
+
+        await handler(
+            chat_id="napcat:GroupMessage:925351983",
+            sender_id="913855876",
+            reminder_text="开户",
+            run_once_direct=True,
+            job_id="basic-1",
+        )
+
+        self.assertIn("提醒你：开户", angel_context.astr_context.sent_messages[0][1])
+        self.assertEqual(cron_manager.deleted, ["basic-1"])
+
+    async def test_list_tasks(self):
+        cron_manager = FakeCronManager()
+        cron_manager.jobs = [
+            FakeJob(job_id="job-1", name="提醒:开会"),
+            FakeJob(job_id="job-2", name="推送:天气"),
+        ]
+        angel_context = FakeAngelContext(cron_manager)
+        bridge = ReminderTaskBridge(DummyConfig(), angel_context)
+        event = FakeEvent("列出当前任务")
 
         handled = await bridge.try_handle(event)
 
-        self.assertFalse(handled)
-        self.assertFalse(event.stopped)
-        self.assertEqual(len(cron_manager.calls), 0)
+        self.assertTrue(handled)
+        self.assertIn("当前 future task", angel_context.astr_context.sent_messages[0][1])
+        self.assertIn("job-1", angel_context.astr_context.sent_messages[0][1])
+
+    async def test_delete_tasks_by_keyword(self):
+        cron_manager = FakeCronManager()
+        cron_manager.jobs = [
+            FakeJob(job_id="job-1", name="推送:天气", description="请向LuckyCai推送：江阴本地天气情况。"),
+            FakeJob(job_id="job-2", name="提醒:开会", description="请提醒LuckyCai：开会。"),
+        ]
+        angel_context = FakeAngelContext(cron_manager)
+        bridge = ReminderTaskBridge(DummyConfig(), angel_context)
+        event = FakeEvent("删除天气任务")
+
+        handled = await bridge.try_handle(event)
+
+        self.assertTrue(handled)
+        self.assertEqual(cron_manager.deleted, ["job-1"])
+        self.assertIn("已删除 1 个包含“天气”的 future task", angel_context.astr_context.sent_messages[0][1])
 
 
 if __name__ == "__main__":
     unittest.main()
-

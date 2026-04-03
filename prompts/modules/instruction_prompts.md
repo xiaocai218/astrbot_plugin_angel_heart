@@ -12,6 +12,11 @@
 - `suppression_reason`：(string) 若应压制，填写简短原因，如 `heated_conflict`、`human_private_exchange`、`ignored_recently`、`low_value_smalltalk`。
 - `conversation_mode`：(string) 当前氛围类型，只能从 `directed_to_ai`、`human_to_human`、`heated`、`small_talk`、`general_discussion` 中选择。
 - `engagement_hint`：(string) 最近 AI 介入反馈，只能从 `unknown`、`ignored_recently`、`welcomed_recently` 中选择。
+- `thread_topic`：(string) 当前线程窗口的话题概括。
+- `addressing_mode`：(string) 当前主要是在对谁说，只能从 `to_ai`、`to_human`、`group_broadcast`、`unclear` 中选择。
+- `reply_value`：(string) AI 此时介入的价值，只能从 `high`、`medium`、`low` 中选择。
+- `needs_reply_now`：(boolean) 从语义上看，这一轮是否应该立即回应。
+- `reason_tags`：(array[string]) 1-4 个简短原因标签，如 `direct_followup`、`advice_request`、`private_chatting`。
 - `reply_strategy`：(string) 概述你计划采用的策略。如果 `should_reply` 为 `false`，此项应为 "继续观察"。
 - `topic`：(string) 对当前唯一核心话题的简要概括。
 - `reply_target`：(string) 回复目标用户的昵称或ID。如果不需要回复，此项应为空字符串。
@@ -40,6 +45,11 @@
   "suppression_reason": "",
   "conversation_mode": "directed_to_ai",
   "engagement_hint": "welcomed_recently",
+  "thread_topic": "Python代码调试",
+  "addressing_mode": "to_ai",
+  "reply_value": "high",
+  "needs_reply_now": true,
+  "reason_tags": ["direct_followup", "advice_request"],
   "reply_strategy": "提供技术解决方案",
   "topic": "Python代码调试",
   "reply_target": "小明",

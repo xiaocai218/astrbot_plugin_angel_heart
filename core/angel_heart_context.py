@@ -55,6 +55,8 @@ class AngelHeartContext:
         self.pending_futures: Dict[str, asyncio.Future] = {}
         # pending_events[chat_id] = 正在等待的事件对象（用于检测事件是否被停止）
         self.pending_events: Dict[str, Any] = {}
+        # 延后处理事件：chat_id -> 最近一条因扣押超时而延后的事件
+        self.deferred_events: Dict[str, Any] = {}
         # dispatch_lock: 取号排队锁，防止来访者插队
         self.dispatch_lock: asyncio.Lock = asyncio.Lock()
 
@@ -286,7 +288,7 @@ class AngelHeartContext:
 
             # 4. 启动新的扣押超时计时器（最长等待时间）
             self.detention_timeout_timers[chat_id] = asyncio.create_task(
-                self._detention_timeout_handler(chat_id)
+                self._detention_timeout_handler(chat_id, new_ticket, event)
             )
 
             logger.info(
@@ -296,7 +298,7 @@ class AngelHeartContext:
             # 5. 返回等候牌给来访者
             return new_ticket
 
-    async def _detention_timeout_handler(self, chat_id: str):
+    async def _detention_timeout_handler(self, chat_id: str, ticket: asyncio.Future, event=None):
         """
         扣押超时处理
 
@@ -312,6 +314,7 @@ class AngelHeartContext:
             chat_id (str): 来访者ID
         """
         try:
+            current_timer = asyncio.current_task()
             # 1. 设置轮询参数
             detention_timeout_seconds = int(self.detention_max_wait_time)  # 扣押超时时间：使用配置的等待时间
             recheck_interval_seconds = 3  # 每3秒检查一次
@@ -322,10 +325,9 @@ class AngelHeartContext:
             # 2. 进入轮询等待模式
             while total_waited < detention_timeout_seconds:
                 # 【新增】检查事件是否被撤回插件停止
-                event = self.pending_events.get(chat_id)
-                if event and hasattr(event, 'is_stopped') and event.is_stopped():
+                current_event = self.pending_events.get(chat_id)
+                if current_event is event and event and hasattr(event, 'is_stopped') and event.is_stopped():
                     # 事件被撤回插件停止了！立即结束等待
-                    ticket = self.pending_futures.get(chat_id)
                     if ticket and not ticket.done():
                         logger.info(
                             f"AngelHeart[{chat_id}]: 检测到等候的事件被撤回，立即结束等待"
@@ -333,13 +335,12 @@ class AngelHeartContext:
                         ticket.set_result("KILL")  # 叫号：离开
 
                     # 清理扣押记录
-                    self._cleanup_detention_resources(chat_id)
+                    self._cleanup_detention_resources(chat_id, ticket=ticket, timer=current_timer, event=event)
                     return  # 等候被撤回结束
 
                 # 【简化】检查老板是否已经空闲（门锁已包含冷却机制）
                 if not await self.is_chat_processing(chat_id):
                     # 老板空闲！请来访者进来
-                    ticket = self.pending_futures.get(chat_id)
                     if ticket and not ticket.done():
                         logger.info(
                             f"AngelHeart[{chat_id}]: 老板已空闲 (等待了{total_waited}秒)，请来访者进来"
@@ -347,50 +348,65 @@ class AngelHeartContext:
                         ticket.set_result("PROCESS")  # 叫号：请进
 
                     # 清理扣押记录
-                    self._cleanup_detention_resources(chat_id)
+                    self._cleanup_detention_resources(chat_id, ticket=ticket, timer=current_timer, event=event)
                     return  # 等候成功结束
 
                 # 老板还在忙，继续等
                 await asyncio.sleep(recheck_interval_seconds)
                 total_waited += recheck_interval_seconds
 
-            # 4. 超时处理：等太久了，请来访者离开
+            # 4. 超时处理：等太久了，将消息延后到后续轮次处理，避免静默丢失
             logger.warning(
-                f"AngelHeart[{chat_id}]: 等候超过{detention_timeout_seconds}秒，请来访者离开"
+                f"AngelHeart[{chat_id}]: 等候超过{detention_timeout_seconds}秒，延后到后续轮次处理"
             )
-            ticket = self.pending_futures.get(chat_id)
             if ticket and not ticket.done():
-                ticket.set_result("KILL")  # 叫号：不好意思，今天不接待了
+                ticket.set_result("DEFER")  # 叫号：本轮不接待，但消息保留待后续分析
 
             # 清理扣押记录
-            self._cleanup_detention_resources(chat_id)
+            self._cleanup_detention_resources(chat_id, ticket=ticket, timer=current_timer, event=event)
 
         except asyncio.CancelledError:
             logger.debug(f"AngelHeart[{chat_id}]: 等候被取消（老板直接叫号了）")
             # 清理事件记录
-            self._cleanup_detention_resources(chat_id)
+            self._cleanup_detention_resources(chat_id, ticket=ticket, timer=asyncio.current_task(), event=event)
         except Exception as e:
             logger.error(
                 f"AngelHeart[{chat_id}]: 等候处理出错: {e}", exc_info=True
             )
-            self._cleanup_detention_resources(chat_id)
+            self._cleanup_detention_resources(chat_id, ticket=ticket, timer=asyncio.current_task(), event=event)
 
-    def _cleanup_detention_resources(self, chat_id: str):
+    def _cleanup_detention_resources(self, chat_id: str, ticket: asyncio.Future | None = None, timer: asyncio.Task | None = None, event=None):
         """
         清理单个会话的扣押相关资源
 
         Args:
             chat_id (str): 会话ID
         """
-        # 清理扣押记录
-        self.pending_futures.pop(chat_id, None)
-        self.detention_timeout_timers.pop(chat_id, None)
-        self.pending_events.pop(chat_id, None)
+        current_ticket = self.pending_futures.get(chat_id)
+        if ticket is None or current_ticket is ticket:
+            self.pending_futures.pop(chat_id, None)
+
+        current_timer = self.detention_timeout_timers.get(chat_id)
+        if timer is None or current_timer is timer:
+            self.detention_timeout_timers.pop(chat_id, None)
+
+        current_event = self.pending_events.get(chat_id)
+        if event is None or current_event is event:
+            self.pending_events.pop(chat_id, None)
 
         # 注意：这里不能清理 processing_chats / lock_cooldown_until。
         # 门牌与冷却期属于会话处理锁生命周期，应仅由 acquire/release 维护。
         # 否则会在排队清理时误放行正在处理中的会话，导致并发串线。
         logger.debug(f"AngelHeart[{chat_id}]: 已清理该会话的扣押资源")
+
+    def store_deferred_event(self, chat_id: str, event: Any):
+        """保存最近一条延后处理事件，后续在门锁释放时自动补处理。"""
+        self.deferred_events[chat_id] = event
+        logger.debug(f"AngelHeart[{chat_id}]: 已暂存一条延后处理事件")
+
+    def pop_deferred_event(self, chat_id: str) -> Optional[Any]:
+        """取出最近一条延后处理事件。"""
+        return self.deferred_events.pop(chat_id, None)
 
     # ========== V3: Patience Timer (Multi-Stage) ==========
 

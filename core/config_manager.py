@@ -141,6 +141,11 @@ class ConfigManager:
         """是否启用提醒语句到 AstrBot 未来任务的桥接。"""
         return self._config.get("reminder_future_task_enabled", True)
 
+    @property
+    def reminder_direct_delivery_enabled(self) -> bool:
+        """是否让提醒类任务走确定性直发轨道。"""
+        return self._config.get("reminder_direct_delivery_enabled", True)
+
     # ========== 4状态机制新增配置 ==========
 
     @property
@@ -202,6 +207,43 @@ class ConfigManager:
             int: 最少消息数，默认2条
         """
         return max(1, int(self._config.get("observation_min_messages", 2)))
+
+    @property
+    def observation_followup_score_threshold(self) -> int:
+        """明显续聊 AI 时触发强放行的分数阈值。"""
+        return int(self._config.get("observation_followup_score_threshold", 4))
+
+    @property
+    def observation_followup_time_window(self) -> int:
+        """AI 回复后多长时间内的续聊视为高概率在接 AI。"""
+        return max(30, int(self._config.get("observation_followup_time_window", 120)))
+
+    @property
+    def observation_followup_short_phrases(self) -> list[str]:
+        """明显在接 AI 的短句承接词。"""
+        raw = self._config.get(
+            "observation_followup_short_phrases",
+            "确实|也是|那倒是|有道理|难说|还真是|对啊|对的|是啊|没错",
+        )
+        return [item.strip() for item in str(raw).split("|") if item.strip()]
+
+    @property
+    def observation_followup_question_phrases(self) -> list[str]:
+        """明显在继续追问 AI 的词表。"""
+        raw = self._config.get(
+            "observation_followup_question_phrases",
+            "那后面呢|所以你的意思是|那现在咋办|那怎么办|那我这套|那怎么改|你觉得呢|继续说|展开讲讲",
+        )
+        return [item.strip() for item in str(raw).split("|") if item.strip()]
+
+    @property
+    def observation_followup_feedback_phrases(self) -> list[str]:
+        """明显在回应 AI 的反馈型词表。"""
+        raw = self._config.get(
+            "observation_followup_feedback_phrases",
+            "你这说得对|我就是这个意思|那你继续说|你继续|你展开讲讲|你说得对|是这个意思",
+        )
+        return [item.strip() for item in str(raw).split("|") if item.strip()]
 
     @property
     def echo_detection_window(self) -> int:
@@ -360,6 +402,7 @@ class ConfigManager:
                 "comfort_words": self.comfort_words,
                 "patience_enabled": self.patience_enabled,
                 "reminder_future_task_enabled": self.reminder_future_task_enabled,
+                "reminder_direct_delivery_enabled": self.reminder_direct_delivery_enabled,
                 "slap_words": self.slap_words,
                 "silence_duration": self.silence_duration,
             },
@@ -368,6 +411,9 @@ class ConfigManager:
                 "dense_conversation_threshold": self.dense_conversation_threshold,
                 "familiarity_timeout": self.familiarity_timeout,
                 "observation_timeout": self.observation_timeout,
+                "observation_min_messages": self.observation_min_messages,
+                "observation_followup_score_threshold": self.observation_followup_score_threshold,
+                "observation_followup_time_window": self.observation_followup_time_window,
                 "familiarity_cooldown_duration": self.familiarity_cooldown_duration,
                 "leave_echo_reply": self.leave_echo_reply,
                 "leave_dense_reply": self.leave_dense_reply,
@@ -385,5 +431,8 @@ class ConfigManager:
                 "air_reading_suppress_ignored_recently": self.air_reading_suppress_ignored_recently,
                 "air_reading_suppress_heated": self.air_reading_suppress_heated,
                 "air_reading_suppress_smalltalk": self.air_reading_suppress_smalltalk,
+                "observation_followup_short_phrases": self.observation_followup_short_phrases,
+                "observation_followup_question_phrases": self.observation_followup_question_phrases,
+                "observation_followup_feedback_phrases": self.observation_followup_feedback_phrases,
             },
         }

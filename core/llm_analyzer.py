@@ -441,6 +441,11 @@ class LLMAnalyzer:
             "suppression_reason",
             "conversation_mode",
             "engagement_hint",
+            "thread_topic",
+            "addressing_mode",
+            "reply_value",
+            "needs_reply_now",
+            "reason_tags",
         ]
 
         # 使用JsonParser提取JSON数据
@@ -488,6 +493,19 @@ class LLMAnalyzer:
             {"unknown", "ignored_recently", "welcomed_recently"},
             "unknown",
         )
+        thread_topic = self._normalize_text_field(raw.get("thread_topic"), "")
+        addressing_mode = self._normalize_enum_text(
+            raw.get("addressing_mode"),
+            {"to_ai", "to_human", "group_broadcast", "unclear"},
+            "unclear",
+        )
+        reply_value = self._normalize_enum_text(
+            raw.get("reply_value"),
+            {"high", "medium", "low"},
+            "low",
+        )
+        needs_reply_now = self._normalize_bool(raw.get("needs_reply_now", should_reply))
+        reason_tags = self._normalize_string_list(raw.get("reason_tags", []))
 
         reply_strategy = self._normalize_text_field(raw.get("reply_strategy"), "未知策略")
         topic = self._normalize_text_field(raw.get("topic"), "未知话题")
@@ -508,6 +526,9 @@ class LLMAnalyzer:
             suppression_reason=suppression_reason,
             conversation_mode=conversation_mode,
             engagement_hint=engagement_hint,
+            thread_topic=thread_topic or topic,
+            addressing_mode=addressing_mode,
+            reply_value=reply_value,
             reply_strategy=reply_strategy,
             topic=topic,
             reply_target=reply_target,
@@ -515,6 +536,7 @@ class LLMAnalyzer:
             facts=facts,
             keywords=keywords,
         )
+        decision.should_reply = needs_reply_now
 
         if air_signal:
             decision.air_score = air_signal.air_score
@@ -522,6 +544,8 @@ class LLMAnalyzer:
             decision.suppression_reason = air_signal.suppression_reason
             decision.conversation_mode = air_signal.conversation_mode
             decision.engagement_hint = air_signal.engagement_hint
+        if reason_tags and not decision.keywords:
+            decision.keywords = reason_tags[:3]
 
         # 代码校验和修正逻辑
         if (
@@ -549,6 +573,13 @@ class LLMAnalyzer:
             )
             decision.should_reply = False
             decision.reply_strategy = decision.suppression_reason or "继续观察"
+
+        logger.info(
+            f"LLMReview | needs_reply_now={decision.should_reply} "
+            f"| addressing_mode={decision.addressing_mode} "
+            f"| reply_value={decision.reply_value} "
+            f"| thread_topic={decision.thread_topic or decision.topic}"
+        )
 
         return decision
 

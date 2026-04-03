@@ -27,6 +27,8 @@ from ..core.image_processor import ImageProcessor
 from ..core.fishing_direct_reply import FishingDirectReply
 from ..core.message_processor import MessageProcessor
 from ..core.reminder_task_bridge import ReminderTaskBridge
+from ..core.thread_window import ThreadWindowBuilder
+from ..models.decision_context import ThreadWindow
 
 # 导入状态枚举
 from ..core.angel_heart_status import AngelHeartStatus
@@ -61,6 +63,7 @@ class FrontDesk:
         # 初始化混脸熟直接回复处理器
         self.fishing_reply = FishingDirectReply(config_manager, angel_context)
         self.reminder_task_bridge = ReminderTaskBridge(config_manager, angel_context)
+        self.thread_window_builder = ThreadWindowBuilder(config_manager)
 
         # secretary 引用将由 main.py 设置
         self.secretary = None
@@ -234,6 +237,7 @@ class FrontDesk:
         chat_id = event.unified_msg_origin
         current_time = time.time()
         message_content = event.get_message_outline()
+        is_replayed_event = bool(event.get_extra("angelheart_replayed", False))
 
         try:
             self._ensure_internal_event_id(event)
@@ -276,13 +280,17 @@ class FrontDesk:
                         event.stop_event()
                         return
 
-            # 4. 【核心】缓存消息
-            await self.cache_message(chat_id, event)
+            if is_replayed_event:
+                event.set_extra("angelheart_replayed", False)
+                logger.info(f"AngelHeart[{chat_id}]: 检测到延后消息重放，跳过重复缓存，直接进入秘书处理")
+            else:
+                # 4. 【核心】缓存消息
+                await self.cache_message(chat_id, event)
 
-            # 4.1 明确提醒请求优先桥接到 AstrBot future task，避免主模型口头答应但未建任务
-            if await self.reminder_task_bridge.try_handle(event):
-                logger.debug(f"AngelHeart[{chat_id}]: 提醒桥接已接管本轮消息")
-                return
+                # 4.1 明确提醒请求优先桥接到 AstrBot future task，避免主模型口头答应但未建任务
+                if await self.reminder_task_bridge.try_handle(event):
+                    logger.debug(f"AngelHeart[{chat_id}]: 提醒桥接已接管本轮消息")
+                    return
 
             # 私聊由主框架直接响应，这里只负责缓存，不走秘书分析链路
             if self._is_private_chat(chat_id):
@@ -292,7 +300,8 @@ class FrontDesk:
                 return
 
             # 5. 检查并补充历史消息，确保至少有7条上下文
-            await self._ensure_minimum_context(chat_id, event)
+            if not is_replayed_event:
+                await self._ensure_minimum_context(chat_id, event)
 
             # 6. 通知秘书处理
             await self._notify_secretary(event)
@@ -388,6 +397,16 @@ class FrontDesk:
                 result_obj.chain = []
             event.stop_event()
             return
+        elif result == "DEFER":
+            self.context.store_deferred_event(chat_id, event)
+            logger.info(
+                f"AngelHeart[{chat_id}]: 扣押消息等待超时，延后到后续轮次分析，本轮不丢弃消息"
+            )
+            result_obj = event.get_result()
+            if result_obj:
+                result_obj.chain = []
+            event.stop_event()
+            return
         elif result == "PROCESS":
             logger.info(f"AngelHeart[{chat_id}]: 扣押解除，继续处理消息")
         else:
@@ -431,6 +450,7 @@ class FrontDesk:
                 # 决策不需要回复，立即释放门锁（设置较短的“不回复”冷却）
                 no_reply_cd = self.context.config_manager.no_reply_cooldown
                 await self.context.release_chat_processing(chat_id, set_cooldown=True, duration=no_reply_cd)
+                await self.resume_deferred_if_any(chat_id)
             # 注意：需要回复的情况，门锁释放由 main.py 的 strip_markdown_on_decorating_result 方法统一处理
         except Exception as e:
             event_id = self._get_event_message_id(event)
@@ -441,6 +461,7 @@ class FrontDesk:
             # 发生异常时也要释放门锁，避免死锁
             try:
                 await self.context.release_chat_processing(chat_id, set_cooldown=False)
+                await self.resume_deferred_if_any(chat_id)
                 logger.warning(
                     f"AngelHeart[{chat_id}]: 已因异常释放门锁 (event_id={event_id})"
                 )
@@ -609,6 +630,41 @@ class FrontDesk:
             )
             # 发生异常时，终止事件传播
             event.stop_event()
+
+    async def resume_deferred_if_any(self, chat_id: str):
+        """门锁释放后，自动把最近一条延后消息重新投入事件队列。"""
+        event = self.context.pop_deferred_event(chat_id)
+        if not event:
+            return
+
+        if not self._has_replayable_deferred_message(chat_id, event):
+            logger.info(f"AngelHeart[{chat_id}]: 延后消息已无可消费的未处理上下文，跳过重放")
+            return
+
+        logger.info(f"AngelHeart[{chat_id}]: 检测到延后消息，准备重新投入事件队列")
+        try:
+            event.clear_result()
+            event.continue_event()
+            event.set_extra("angelheart_replayed", True)
+            self.astr_context.get_event_queue().put_nowait(event)
+            logger.info(f"AngelHeart[{chat_id}]: 延后消息已重新入队")
+        except Exception as e:
+            logger.error(f"AngelHeart[{chat_id}]: 延后消息重新入队失败: {e}", exc_info=True)
+
+    def _has_replayable_deferred_message(self, chat_id: str, event: AstrMessageEvent) -> bool:
+        """仅在 ledger 中仍有这条延后事件对应的未处理消息时才允许重放。"""
+        event_id = self._get_event_message_id(event)
+        _, recent_dialogue, _ = partition_dialogue_raw(self.context.conversation_ledger, chat_id)
+        if not recent_dialogue:
+            return False
+
+        if event_id:
+            return any(
+                str(message.get("source_event_id", "") or "") == event_id
+                for message in recent_dialogue
+            )
+
+        return any(message.get("role") == "user" for message in recent_dialogue)
 
     async def _ensure_minimum_context(self, chat_id: str, event: AstrMessageEvent):
         """
@@ -953,14 +1009,7 @@ class FrontDesk:
         if not decision:
             return None, None, None, None
 
-        # 2. 获取最近的对话数据
-        _, recent_dialogue, boundary_ts = self.context.conversation_ledger.get_context_snapshot(chat_id)
-
-        # 3. 获取历史对话用于构建完整上下文
-        historical_context, _, _ = partition_dialogue_raw(
-            self.context.conversation_ledger, chat_id
-        )
-
+        recent_dialogue, historical_context, boundary_ts, _ = self._get_thread_scoped_conversation_data(chat_id)
         return decision, recent_dialogue, historical_context, boundary_ts
 
     def _is_group_chat(self, chat_id: str) -> bool:
@@ -979,10 +1028,36 @@ class FrontDesk:
 
         用于私聊等直接响应场景，只重写聊天记录，不要求存在秘书分析结果。
         """
+        recent_dialogue, historical_context, boundary_ts, _ = self._get_thread_scoped_conversation_data(chat_id)
+        return recent_dialogue, historical_context, boundary_ts
+
+    def _get_thread_scoped_conversation_data(self, chat_id: str):
+        """优先基于当前线程窗口构造上下文，避免把旧未处理话题整段卷入主脑。"""
         historical_context, recent_dialogue, boundary_ts = partition_dialogue_raw(
             self.context.conversation_ledger, chat_id
         )
-        return recent_dialogue, historical_context, boundary_ts
+        thread_window = self.thread_window_builder.build(historical_context, recent_dialogue)
+        thread_recent = list(thread_window.current_thread_messages or recent_dialogue)
+
+        anchor_ts = 0.0
+        if thread_window.last_assistant_turn:
+            anchor_ts = float(thread_window.last_assistant_turn.get("timestamp") or 0)
+        elif thread_recent:
+            anchor_ts = float(thread_recent[0].get("timestamp") or 0)
+
+        if anchor_ts > 0:
+            thread_historical = [
+                msg for msg in historical_context
+                if float(msg.get("timestamp") or 0) < anchor_ts
+            ][-6:]
+        else:
+            thread_historical = historical_context[-6:]
+
+        thread_boundary_ts = boundary_ts
+        if thread_recent:
+            thread_boundary_ts = max(float(msg.get("timestamp") or 0) for msg in thread_recent)
+
+        return thread_recent, thread_historical, thread_boundary_ts, thread_window
 
     def _generate_final_prompt(self, recent_dialogue: List[Dict], decision: Any, alias: str) -> str:
         """生成聚焦指令"""
@@ -1060,6 +1135,46 @@ class FrontDesk:
         else:
             req.system_prompt = original_system_prompt
 
+    def _block_llm_without_context(self, chat_id: str, event: AstrMessageEvent, req: Any):
+        """群聊自然唤醒但缺少最小线程上下文时，阻止主链裸跑。"""
+        logger.warning(
+            f"AngelHeart[{chat_id}]: 无法构建最小线程上下文，阻止主链在空上下文下自由回复。"
+        )
+        req.contexts = []
+        req.prompt = ""
+        req.image_urls = []
+        original_system_prompt = getattr(req, "system_prompt", "")
+        req.system_prompt = (
+            f"{original_system_prompt}\n\n当前缺少有效上下文，本轮不要生成任何回复。"
+        ).strip()
+        event.set_extra("angelheart_blocked_no_context", True)
+        event.stop_event()
+
+    def _build_minimal_event_context(self, event: AstrMessageEvent) -> tuple[List[Dict], List[Dict], ThreadWindow] | None:
+        """当 ledger 暂时拿不到线程窗口时，使用当前事件构造最小上下文。"""
+        outline = str(event.get_message_outline() or "").strip()
+        if not outline:
+            return None
+
+        source_event_id = self._get_event_message_id(event)
+        is_directed_to_bot, summon_source = self._extract_directed_to_bot_flags(event)
+        message = {
+            "role": "user",
+            "content": [{"type": "text", "text": outline}],
+            "sender_id": event.get_sender_id(),
+            "sender_name": event.get_sender_name(),
+            "source_event_id": source_event_id,
+            "timestamp": (
+                event.get_timestamp()
+                if hasattr(event, "get_timestamp") and event.get_timestamp()
+                else time.time()
+            ),
+            "is_directed_to_bot": is_directed_to_bot,
+            "summon_source": summon_source,
+        }
+        thread_window = self.thread_window_builder.build([], [message])
+        return [message], [], thread_window
+
     async def rewrite_prompt_for_llm(self, chat_id: str, event: AstrMessageEvent, req: Any):
         """
         重构请求体，实现完整的对话历史格式化和指令注入。
@@ -1076,15 +1191,35 @@ class FrontDesk:
 
         if self._is_group_chat(chat_id):
             # 群聊依赖秘书决策来构造聚焦指令
-            decision, recent_dialogue, historical_context, _ = self._get_conversation_data(chat_id)
+            recent_dialogue, historical_context, _, thread_window = self._get_thread_scoped_conversation_data(chat_id)
+            decision = self.secretary.get_decision(chat_id) if self.secretary else None
             if not decision:
-                logger.debug(f"AngelHeart[{chat_id}]: 群聊尚无秘书决策，跳过重构。")
-                return
-
-            final_prompt_str = self._generate_final_prompt(recent_dialogue, decision, alias)
-            should_mark_processed = bool(decision and decision.should_reply)
-            scene_hint = "这是一个群聊场景。"
-            scene_prompt = "你正在一个群聊中扮演角色，你的昵称是 '{alias}'。"
+                if thread_window.current_thread_messages or recent_dialogue or historical_context:
+                    logger.info(
+                        f"AngelHeart[{chat_id}]: 群聊暂无秘书决策，但已构建线程窗口，按最小线程上下文重构请求。"
+                    )
+                    final_prompt_str = self._generate_final_prompt(recent_dialogue, None, alias)
+                    should_mark_processed = False
+                    scene_hint = "这是一个群聊场景。"
+                    scene_prompt = "你正在一个群聊中扮演角色，你的昵称是 '{alias}'。"
+                else:
+                    fallback_context = self._build_minimal_event_context(event)
+                    if not fallback_context:
+                        self._block_llm_without_context(chat_id, event, req)
+                        return
+                    recent_dialogue, historical_context, thread_window = fallback_context
+                    logger.info(
+                        f"AngelHeart[{chat_id}]: ledger 未命中线程窗口，已回退到当前事件构造最小上下文。"
+                    )
+                    final_prompt_str = self._generate_final_prompt(recent_dialogue, None, alias)
+                    should_mark_processed = False
+                    scene_hint = "这是一个群聊场景。"
+                    scene_prompt = "你正在一个群聊中扮演角色，你的昵称是 '{alias}'。"
+            else:
+                final_prompt_str = self._generate_final_prompt(recent_dialogue, decision, alias)
+                should_mark_processed = bool(decision and decision.should_reply)
+                scene_hint = "这是一个群聊场景。"
+                scene_prompt = "你正在一个群聊中扮演角色，你的昵称是 '{alias}'。"
         else:
             # 私聊直接响应，不依赖秘书决策，但仍需重写聊天记录
             recent_dialogue, historical_context, _ = self._get_conversation_data_without_decision(chat_id)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import time
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -22,7 +23,7 @@ except ImportError:
     logger = logging.getLogger(__name__)
 
 from astrbot.api.event import MessageChain
-from astrbot.core.message.components import Plain
+from astrbot.core.message.components import Plain, At
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -66,6 +67,18 @@ EXPLICIT_REMINDER_MARKERS = (
     "到时候提醒我",
     "到点提醒我",
 )
+EXPLICIT_DELIVERY_MARKERS = (
+    "推送",
+    "发送",
+    "通知",
+    "播报",
+)
+TRAILING_STRATEGY_PATTERN = re.compile(
+    r"(?:[，,\s]*(?:不需要覆盖|不要覆盖|不用覆盖|别覆盖|保留原任务|保留旧任务|两个任务并存|任务并存).*)$"
+)
+LIST_TASK_MARKERS = ("列出任务", "查看任务", "看看任务", "当前任务", "有哪些任务", "未来任务")
+DELETE_TASK_VERBS = ("删除", "取消", "移除", "关闭", "停掉", "停止")
+TASK_NOUN_MARKERS = ("任务", "提醒", "推送", "通知", "播报")
 ONE_SHOT_DUE_AT_PARSERS = (
     "_parse_relative_due_at",
     "_parse_every_n_days_due_at",
@@ -88,6 +101,9 @@ class ReminderIntent:
     reminder_text: str
     task_name: str
     note: str
+    action_label: str = "提醒"
+    keep_existing: bool = False
+    request_kind: str = "reminder"
     cron_expression: str | None = None
     run_once: bool = True
 
@@ -99,20 +115,28 @@ class ReminderParseResult:
     error_message: str = ""
 
 
+@dataclass
+class TaskManagementIntent:
+    operation: str
+    keyword: str = ""
+
+
 class ReminderTaskBridge:
     """将显式提醒语句桥接到 AstrBot future task。"""
 
     def __init__(self, config_manager, angel_context):
         self.config_manager = config_manager
         self.angel_context = angel_context
+        self._bootstrap_task_started = False
+        self._try_start_direct_job_bootstrap()
 
     def parse(self, text: str, sender_name: str = "", now: datetime | None = None) -> ReminderParseResult:
         raw_text = str(text or "").strip()
         if not raw_text:
             return ReminderParseResult()
 
-        marker = self._find_explicit_marker(raw_text)
-        if not marker:
+        request_kind, marker = self._detect_explicit_request(raw_text)
+        if not request_kind:
             return ReminderParseResult()
 
         now_dt = now or datetime.now(SHANGHAI_TZ)
@@ -120,10 +144,10 @@ class ReminderTaskBridge:
         if due_at is None:
             return ReminderParseResult(
                 explicit_request=True,
-                error_message="没看懂提醒时间，暂时只支持今天/明天/后天 + 具体时刻。",
+                error_message="没看懂任务时间，暂时只支持常见的提醒/推送时间表达。",
             )
 
-        reminder_text = self._extract_reminder_text(raw_text, marker)
+        reminder_text = self._extract_task_text(raw_text, marker, request_kind)
         if not reminder_text:
             reminder_text = "查看待办事项"
 
@@ -135,7 +159,7 @@ class ReminderTaskBridge:
 
         return ReminderParseResult(
             explicit_request=True,
-            intent=self._build_intent(raw_text, sender_name, due_at, reminder_text),
+            intent=self._build_intent(raw_text, sender_name, due_at, reminder_text, request_kind),
         )
 
     async def try_handle(self, event: Any) -> bool:
@@ -146,6 +170,10 @@ class ReminderTaskBridge:
         chat_id = event.unified_msg_origin
         outline = event.get_message_outline()
         sender_name = str(event.get_sender_name() or "").strip()
+        management_intent = self._parse_task_management_intent(outline)
+        if management_intent:
+            return await self._handle_task_management(event, management_intent)
+
         parse_result = self.parse(outline, sender_name=sender_name)
 
         if not parse_result.explicit_request:
@@ -201,11 +229,102 @@ class ReminderTaskBridge:
         event.stop_event()
         return True
 
-    def _find_explicit_marker(self, text: str) -> str:
+    async def _handle_task_management(self, event: Any, intent: TaskManagementIntent) -> bool:
+        chat_id = event.unified_msg_origin
+        try:
+            jobs = await self._list_session_jobs(chat_id)
+            if intent.operation == "list":
+                await self._send_feedback(chat_id, self._format_job_list(jobs))
+            elif intent.operation == "delete":
+                matched_jobs = self._match_jobs_by_keyword(jobs, intent.keyword)
+                if not matched_jobs:
+                    await self._send_feedback(chat_id, f"没有找到包含“{intent.keyword}”的未来任务。")
+                else:
+                    cron_manager = self._get_cron_manager()
+                    for job in matched_jobs:
+                        await cron_manager.delete_job(job.job_id)
+                    await self._send_feedback(chat_id, self._format_deleted_jobs(intent.keyword, matched_jobs))
+            else:
+                return False
+        except Exception as exc:
+            logger.error("AngelHeart[%s]: 任务管理桥接失败: %s", chat_id, exc, exc_info=True)
+            await self._send_feedback(chat_id, f"任务管理失败：{exc}")
+        self._mark_latest_user_message_processed(chat_id)
+        event.stop_event()
+        return True
+
+    def _try_start_direct_job_bootstrap(self) -> None:
+        if self._bootstrap_task_started:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._bootstrap_task_started = True
+        loop.create_task(self._bootstrap_direct_jobs())
+
+    async def _bootstrap_direct_jobs(self) -> None:
+        for _ in range(5):
+            try:
+                cron_manager = self._get_cron_manager()
+                jobs = await cron_manager.list_jobs("basic")
+                direct_jobs = [
+                    job
+                    for job in jobs
+                    if isinstance(getattr(job, "payload", None), dict)
+                    and job.payload.get("origin") == "angel_heart_direct_reminder"
+                ]
+                for job in direct_jobs:
+                    cron_manager._basic_handlers[job.job_id] = self._build_direct_reminder_handler()
+                    if getattr(job, "enabled", True) and not cron_manager.scheduler.get_job(job.job_id):
+                        cron_manager._schedule_job(job)
+                if direct_jobs:
+                    logger.info("AngelHeart: 已回收 %s 个直发提醒任务处理器", len(direct_jobs))
+                return
+            except Exception:
+                await asyncio.sleep(2)
+
+    def _detect_explicit_request(self, text: str) -> tuple[str, str]:
+        best_kind = ""
+        best_marker = ""
+        best_index = -1
         for marker in EXPLICIT_REMINDER_MARKERS:
-            if marker in text:
-                return marker
-        return ""
+            marker_index = text.rfind(marker)
+            if marker_index > best_index:
+                best_kind = "reminder"
+                best_marker = marker
+                best_index = marker_index
+        for marker in EXPLICIT_DELIVERY_MARKERS:
+            marker_index = text.rfind(marker)
+            if marker_index > best_index:
+                best_kind = "delivery"
+                best_marker = marker
+                best_index = marker_index
+        return best_kind, best_marker
+
+    def _parse_task_management_intent(self, text: str) -> TaskManagementIntent | None:
+        raw_text = str(text or "").strip()
+        if not raw_text:
+            return None
+        if any(marker in raw_text for marker in LIST_TASK_MARKERS):
+            return TaskManagementIntent(operation="list")
+        if any(verb in raw_text for verb in DELETE_TASK_VERBS) and any(
+            marker in raw_text for marker in TASK_NOUN_MARKERS
+        ):
+            keyword = self._extract_delete_keyword(raw_text)
+            if keyword:
+                return TaskManagementIntent(operation="delete", keyword=keyword)
+        return None
+
+    def _extract_delete_keyword(self, text: str) -> str:
+        candidate = str(text or "")
+        for marker in LIST_TASK_MARKERS + DELETE_TASK_VERBS + TASK_NOUN_MARKERS:
+            candidate = candidate.replace(marker, " ")
+        candidate = TRAILING_STRATEGY_PATTERN.sub("", candidate)
+        candidate = LEADING_TIME_PATTERN.sub("", candidate, count=1)
+        candidate = re.sub(r"\s+", " ", candidate)
+        candidate = candidate.strip(" ，。,.!！?？:： ")
+        return candidate[:40]
 
     def _parse_due_at(self, text: str, now: datetime) -> datetime | None:
         for parser_name in ONE_SHOT_DUE_AT_PARSERS:
@@ -634,7 +753,7 @@ class ReminderTaskBridge:
 
         return hour
 
-    def _extract_reminder_text(self, text: str, marker: str) -> str:
+    def _extract_task_text(self, text: str, marker: str, request_kind: str) -> str:
         marker_index = text.rfind(marker)
         if marker_index >= 0:
             candidate = text[marker_index + len(marker):]
@@ -642,6 +761,7 @@ class ReminderTaskBridge:
             candidate = text
 
         candidate = LEADING_TIME_PATTERN.sub("", candidate, count=1)
+        candidate = TRAILING_STRATEGY_PATTERN.sub("", candidate)
         candidate = candidate.strip(" ，。,.!！?？:：")
 
         if not candidate:
@@ -649,12 +769,27 @@ class ReminderTaskBridge:
             stripped = stripped.replace(marker, "", 1)
             stripped = DAY_PATTERN.sub("", stripped, count=1)
             stripped = TIME_PATTERN.sub("", stripped, count=1)
+            stripped = TRAILING_STRATEGY_PATTERN.sub("", stripped)
             candidate = stripped.strip(" ，。,.!！?？:：")
+
+        if request_kind == "delivery":
+            candidate = candidate.replace("给我", "", 1).replace("一下", "", 1).strip(" ，。,.!！?？:：")
 
         return candidate[:80]
 
-    def _build_intent(self, raw_text: str, sender_name: str, due_at: datetime, reminder_text: str) -> ReminderIntent:
-        task_name = f"提醒:{reminder_text[:18]}"
+    def _build_intent(
+        self,
+        raw_text: str,
+        sender_name: str,
+        due_at: datetime,
+        reminder_text: str,
+        request_kind: str,
+    ) -> ReminderIntent:
+        action_label = "提醒" if request_kind == "reminder" else "推送"
+        keep_existing = any(
+            keyword in raw_text for keyword in ("不需要覆盖", "不要覆盖", "不用覆盖", "别覆盖", "保留原任务", "保留旧任务", "两个任务并存", "任务并存")
+        )
+        task_name = f"{action_label}:{reminder_text[:18]}"
         cron_expression = None
         run_once = True
         every_n_days_match = EVERY_N_DAYS_PATTERN.search(raw_text)
@@ -695,30 +830,26 @@ class ReminderTaskBridge:
                     cron_expression = f"{due_at.minute} {due_at.hour} {day_of_month} * *"
                     run_once = False
 
-        if sender_name:
-            note = (
-                f"请提醒{sender_name}：{reminder_text}。"
-                "直接提醒核心事项，不要说系统已创建任务。"
-            )
+        target_name = sender_name or "用户"
+        if request_kind == "reminder":
+            note = f"请提醒{target_name}：{reminder_text}。直接提醒核心事项，不要说系统已创建任务。"
         else:
-            note = (
-                f"请提醒用户：{reminder_text}。"
-                "直接提醒核心事项，不要说系统已创建任务。"
-            )
+            note = f"请向{target_name}推送：{reminder_text}。直接发送结果，不要说系统已创建任务。"
 
         return ReminderIntent(
             due_at=due_at,
             reminder_text=reminder_text,
             task_name=task_name,
             note=note,
+            action_label=action_label,
+            keep_existing=keep_existing,
+            request_kind=request_kind,
             cron_expression=cron_expression,
             run_once=run_once,
         )
 
     async def _create_future_task(self, event: Any, intent: ReminderIntent) -> Any:
-        cron_manager = getattr(self.angel_context.astr_context, "cron_manager", None)
-        if cron_manager is None:
-            raise RuntimeError("AstrBot cron manager 不可用")
+        cron_manager = self._get_cron_manager()
 
         payload = {
             "session": event.unified_msg_origin,
@@ -726,6 +857,36 @@ class ReminderTaskBridge:
             "note": intent.note,
             "origin": "tool",
         }
+
+        if self._should_use_direct_delivery(intent):
+            direct_payload = {
+                **payload,
+                "origin": "angel_heart_direct_reminder",
+                "chat_id": event.unified_msg_origin,
+                "sender_name": getattr(event, "get_sender_name", lambda: "")() or "",
+                "action_label": intent.action_label,
+                "reminder_text": intent.reminder_text,
+                "run_once_direct": intent.run_once,
+            }
+            cron_expression = (
+                intent.cron_expression
+                if not intent.run_once
+                else self._build_one_shot_cron_expression(intent.due_at)
+            )
+            job = await cron_manager.add_basic_job(
+                name=intent.task_name,
+                cron_expression=cron_expression,
+                handler=self._build_direct_reminder_handler(),
+                description=intent.note,
+                timezone="Asia/Shanghai",
+                payload=direct_payload,
+                enabled=True,
+                persistent=True,
+            )
+            direct_payload["job_id"] = job.job_id
+            await cron_manager.update_job(job.job_id, payload=direct_payload)
+            cron_manager._basic_handlers[job.job_id] = self._build_direct_reminder_handler()
+            return job
 
         return await cron_manager.add_active_job(
             name=intent.task_name,
@@ -736,6 +897,98 @@ class ReminderTaskBridge:
             run_once=intent.run_once,
             run_at=intent.due_at if intent.run_once else None,
         )
+
+    def _should_use_direct_delivery(self, intent: ReminderIntent) -> bool:
+        return (
+            self.config_manager.reminder_direct_delivery_enabled
+            and intent.request_kind == "reminder"
+        )
+
+    def _build_direct_reminder_handler(self):
+        async def _handler(**payload):
+            chat_id = str(payload.get("chat_id") or payload.get("session") or "")
+            reminder_text = str(payload.get("reminder_text") or payload.get("note") or "查看待办事项")
+            sender_id = str(payload.get("sender_id") or "").strip()
+            chain_parts = []
+            if sender_id and "GroupMessage" in chat_id:
+                chain_parts.append(At(qq=sender_id))
+                chain_parts.append(Plain(" "))
+            chain_parts.append(Plain(f"提醒你：{reminder_text}"))
+            chain = MessageChain(chain_parts)
+            await self.angel_context.astr_context.send_message(chat_id, chain)
+            self.angel_context.conversation_ledger.add_message(
+                chat_id,
+                {
+                    "role": "assistant",
+                    "content": f"提醒你：{reminder_text}",
+                    "sender_id": "assistant",
+                    "sender_name": "assistant",
+                    "timestamp": time.time(),
+                    "is_processed": True,
+                },
+            )
+            if payload.get("run_once_direct") and payload.get("job_id"):
+                await self._get_cron_manager().delete_job(str(payload.get("job_id")))
+
+        return _handler
+
+    def _build_one_shot_cron_expression(self, due_at: datetime) -> str:
+        return f"{due_at.minute} {due_at.hour} {due_at.day} {due_at.month} *"
+
+    def _get_cron_manager(self):
+        cron_manager = getattr(self.angel_context.astr_context, "cron_manager", None)
+        if cron_manager is None:
+            raise RuntimeError("AstrBot cron manager 不可用")
+        return cron_manager
+
+    async def _list_session_jobs(self, chat_id: str) -> list[Any]:
+        cron_manager = self._get_cron_manager()
+        jobs = await cron_manager.list_jobs()
+        return [job for job in jobs if self._extract_job_session(job) == chat_id]
+
+    def _extract_job_session(self, job: Any) -> str:
+        payload = getattr(job, "payload", None)
+        if isinstance(payload, dict):
+            return str(payload.get("session") or "")
+        return ""
+
+    def _match_jobs_by_keyword(self, jobs: list[Any], keyword: str) -> list[Any]:
+        normalized_keyword = str(keyword or "").strip()
+        if not normalized_keyword:
+            return []
+        return [job for job in jobs if normalized_keyword in self._job_search_text(job)]
+
+    def _job_search_text(self, job: Any) -> str:
+        payload = getattr(job, "payload", None) or {}
+        return " ".join(
+            str(part or "")
+            for part in (
+                getattr(job, "job_id", ""),
+                getattr(job, "name", ""),
+                getattr(job, "description", ""),
+                payload.get("note", "") if isinstance(payload, dict) else "",
+            )
+        )
+
+    def _format_job_list(self, jobs: list[Any]) -> str:
+        if not jobs:
+            return "当前没有 future task。"
+        lines = ["当前 future task："]
+        for job in jobs[:10]:
+            next_run = getattr(job, "next_run_time", None)
+            next_run_text = str(next_run) if next_run else "未知"
+            lines.append(f"- {job.job_id} | {job.name} | next={next_run_text}")
+        if len(jobs) > 10:
+            lines.append(f"- 其余 {len(jobs) - 10} 个任务未展开")
+        return "\n".join(lines)
+
+    def _format_deleted_jobs(self, keyword: str, jobs: list[Any]) -> str:
+        lines = [f"已删除 {len(jobs)} 个包含“{keyword}”的 future task："]
+        for job in jobs[:5]:
+            lines.append(f"- {job.job_id} | {job.name}")
+        if len(jobs) > 5:
+            lines.append(f"- 其余 {len(jobs) - 5} 个任务未展开")
+        return "\n".join(lines)
 
     async def _send_feedback(self, chat_id: str, text: str):
         chain = MessageChain([Plain(text)])
@@ -769,10 +1022,11 @@ class ReminderTaskBridge:
 
     def _build_confirmation(self, intent: ReminderIntent) -> str:
         time_text = intent.due_at.strftime("%Y-%m-%d %H:%M")
+        coexist_suffix = "，不会覆盖旧任务" if intent.keep_existing else ""
         if intent.run_once:
-            return f"好的，已经为你创建未来任务：{time_text} 提醒你{intent.reminder_text}。"
+            return f"好的，已经为你创建未来任务：{time_text} {intent.action_label}{intent.reminder_text}{coexist_suffix}。"
         recurring_text = self._describe_recurring_schedule(intent)
-        return f"好的，已经为你创建循环未来任务：{recurring_text} 提醒你{intent.reminder_text}。"
+        return f"好的，已经为你创建循环未来任务：{recurring_text} {intent.action_label}{intent.reminder_text}{coexist_suffix}。"
 
     def _weekday_to_cn(self, weekday: int) -> str:
         mapping = ["一", "二", "三", "四", "五", "六", "日"]

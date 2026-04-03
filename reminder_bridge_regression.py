@@ -13,22 +13,84 @@ if str(ASTRBOT_ROOT) not in sys.path:
 from astrbot_plugin_angel_heart.core.reminder_task_bridge import ReminderTaskBridge
 
 
+class DummyScheduler:
+    def __init__(self):
+        self.jobs = {}
+
+    def get_job(self, job_id):
+        return self.jobs.get(job_id)
+
+
 class DummyConfig:
     reminder_future_task_enabled = True
+    reminder_direct_delivery_enabled = True
 
 
 class FakeJob:
-    def __init__(self, job_id="job-1"):
+    def __init__(
+        self,
+        job_id="job-1",
+        name="提醒:开会",
+        description="请提醒LuckyCai：开会。",
+        payload=None,
+        next_run_time="2026-04-02 08:00:00+08:00",
+        enabled=True,
+    ):
         self.job_id = job_id
+        self.name = name
+        self.description = description
+        self.payload = payload or {"session": "napcat:GroupMessage:925351983", "note": description}
+        self.next_run_time = next_run_time
+        self.enabled = enabled
 
 
 class FakeCronManager:
     def __init__(self):
         self.calls = []
+        self.basic_calls = []
+        self.updated = []
+        self.deleted = []
+        self.jobs = []
+        self._basic_handlers = {}
+        self.scheduler = DummyScheduler()
 
     async def add_active_job(self, **kwargs):
         self.calls.append(kwargs)
-        return FakeJob()
+        return FakeJob(
+            job_id=f"active-{len(self.calls)}",
+            name=kwargs.get("name", "job"),
+            description=kwargs.get("description", ""),
+            payload=kwargs.get("payload", {}),
+            next_run_time=kwargs.get("run_at") or "2026-04-02 08:00:00+08:00",
+        )
+
+    async def add_basic_job(self, **kwargs):
+        self.basic_calls.append(kwargs)
+        job = FakeJob(
+            job_id=f"basic-{len(self.basic_calls)}",
+            name=kwargs.get("name", "job"),
+            description=kwargs.get("description", ""),
+            payload=kwargs.get("payload", {}),
+        )
+        self.jobs.append(job)
+        return job
+
+    async def update_job(self, job_id, **kwargs):
+        self.updated.append((job_id, kwargs))
+        for job in self.jobs:
+            if job.job_id == job_id and "payload" in kwargs:
+                job.payload = kwargs["payload"]
+        return next((job for job in self.jobs if job.job_id == job_id), None)
+
+    async def list_jobs(self, job_type=None):
+        return list(self.jobs)
+
+    async def delete_job(self, job_id):
+        self.deleted.append(job_id)
+        self.jobs = [job for job in self.jobs if job.job_id != job_id]
+
+    def _schedule_job(self, job):
+        self.scheduler.jobs[job.job_id] = job
 
 
 class FakeAstrContext:
@@ -98,380 +160,93 @@ def test_parse_success():
     result = bridge.parse("明天早上 8 点提醒我开会", sender_name="LuckyCai")
     assert result.explicit_request is True
     assert result.intent is not None
+    assert result.intent.request_kind == "reminder"
     assert result.intent.reminder_text == "开会"
     assert result.intent.due_at.hour == 8
-    assert result.intent.run_once is True
 
 
-def test_parse_relative_success():
+def test_parse_delivery_keep_existing_success():
     bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("30分钟后提醒我开会", sender_name="LuckyCai")
+    result = bridge.parse("每天早上7点推送江阴本地天气情况，不需要覆盖", sender_name="LuckyCai")
     assert result.explicit_request is True
     assert result.intent is not None
-    assert result.intent.reminder_text == "开会"
-    assert result.intent.run_once is True
+    assert result.intent.request_kind == "delivery"
+    assert result.intent.keep_existing is True
+    assert result.intent.cron_expression == "0 7 * * *"
 
 
-def test_parse_weekly_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("每周一早上8点提醒我开组会", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.reminder_text == "开组会"
-    assert result.intent.run_once is False
-    assert result.intent.cron_expression == "0 8 * * mon"
-
-
-def test_parse_next_week_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("下周三上午9点提醒我开会", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.reminder_text == "开会"
-    assert result.intent.run_once is True
-    assert result.intent.due_at.hour == 9
-
-
-def test_parse_default_period_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("明早提醒我开会", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.reminder_text == "开会"
-    assert result.intent.run_once is True
-    assert result.intent.due_at.hour == 8
-
-
-def test_parse_daily_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("每天晚上11点提醒我睡觉", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.reminder_text == "睡觉"
-    assert result.intent.run_once is False
-    assert result.intent.cron_expression == "0 23 * * *"
-
-
-def test_parse_workday_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("工作日早上9点提醒我打卡", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.reminder_text == "打卡"
-    assert result.intent.run_once is False
-    assert result.intent.cron_expression == "0 9 * * mon-fri"
-
-
-def test_parse_monthly_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("每月15号上午10点提醒我交房租", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.reminder_text == "交房租"
-    assert result.intent.run_once is False
-    assert result.intent.cron_expression == "0 10 15 * *"
-
-
-def test_parse_chinese_time_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("明天下午两点提醒我开会", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.due_at.hour == 14
-    assert result.intent.reminder_text == "开会"
-
-
-def test_parse_next_month_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("下个月3号上午10点提醒我交水电", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.run_once is True
-    assert result.intent.due_at.day == 3
-    assert result.intent.due_at.hour == 10
-
-
-def test_parse_month_end_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("月底晚上8点提醒我对账", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.run_once is True
-    assert result.intent.due_at.hour == 20
-
-
-def test_parse_weekend_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("双休日上午9点提醒我运动", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.run_once is True
-    assert result.intent.due_at.hour == 9
-
-
-def test_parse_tonight_with_explicit_time_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("今晚八点半提醒我收衣服", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.reminder_text == "收衣服"
-    assert result.intent.due_at.hour == 20
-    assert result.intent.due_at.minute == 30
-
-
-def test_parse_next_day_alias_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("隔天早上8点提醒我出门", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.reminder_text == "出门"
-    assert result.intent.due_at.hour == 8
-
-
-def test_parse_next_next_week_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("下下周三上午10点提醒我复盘", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.reminder_text == "复盘"
-    assert result.intent.run_once is True
-    assert result.intent.due_at.hour == 10
-
-
-def test_parse_month_start_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("月初上午9点提醒我做预算", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.reminder_text == "做预算"
-    assert result.intent.run_once is True
-    assert result.intent.due_at.hour == 9
-
-
-def test_parse_chinese_minute_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("后天十一点十五提醒我吃药", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.reminder_text == "吃药"
-    assert result.intent.due_at.hour == 11
-    assert result.intent.due_at.minute == 15
-
-
-def test_parse_spoken_minute_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("明天下午两点二十提醒我开会", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.reminder_text == "开会"
-    assert result.intent.due_at.hour == 14
-    assert result.intent.due_at.minute == 20
-
-
-def test_parse_every_other_week_single_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("隔周一早上9点提醒我写周报", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.reminder_text == "写周报"
-    assert result.intent.run_once is True
-    assert result.intent.due_at.hour == 9
-
-
-def test_parse_monthly_last_day_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("每月最后一天晚上8点提醒我做结算", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.reminder_text == "做结算"
-    assert result.intent.run_once is False
-    assert result.intent.cron_expression == "0 20 28-31 * *"
-
-
-def test_parse_every_two_days_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("每隔两天早上9点提醒我浇花", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.reminder_text == "浇花"
-    assert result.intent.run_once is False
-    assert result.intent.cron_expression == "0 9 */2 * *"
-
-
-def test_parse_quarter_end_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("季度末晚上8点提醒我做汇报", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.reminder_text == "做汇报"
-    assert result.intent.run_once is True
-    assert result.intent.due_at.hour == 20
-
-
-def test_parse_first_workday_success():
-    bridge = ReminderTaskBridge(DummyConfig(), FakeAngelContext(FakeCronManager()))
-    result = bridge.parse("月初第一个工作日上午9点提醒我交报表", sender_name="LuckyCai")
-    assert result.explicit_request is True
-    assert result.intent is not None
-    assert result.intent.reminder_text == "交报表"
-    assert result.intent.run_once is True
-    assert result.intent.due_at.hour == 9
-
-
-async def test_bridge_success():
+async def test_bridge_reminder_uses_direct_basic_job():
     cron_manager = FakeCronManager()
     angel_context = FakeAngelContext(cron_manager)
     bridge = ReminderTaskBridge(DummyConfig(), angel_context)
-    event = FakeEvent("明天早上 8 点提醒我开会")
+    event = FakeEvent("1分钟后提醒我开户")
     handled = await bridge.try_handle(event)
     assert handled is True
-    assert event.stopped is True
-    assert len(cron_manager.calls) == 1
-    assert cron_manager.calls[0]["run_once"] is True
-    assert "开会" in cron_manager.calls[0]["description"]
-    assert angel_context.astr_context.sent_messages
-    assert "创建未来任务" in angel_context.astr_context.sent_messages[0][1]
-
-
-async def test_bridge_weekly_success():
-    cron_manager = FakeCronManager()
-    angel_context = FakeAngelContext(cron_manager)
-    bridge = ReminderTaskBridge(DummyConfig(), angel_context)
-    event = FakeEvent("每周一早上8点提醒我开组会")
-    handled = await bridge.try_handle(event)
-    assert handled is True
-    assert event.stopped is True
-    assert len(cron_manager.calls) == 1
-    assert cron_manager.calls[0]["run_once"] is False
-    assert cron_manager.calls[0]["cron_expression"] == "0 8 * * mon"
-    assert "循环未来任务" in angel_context.astr_context.sent_messages[0][1]
-
-
-async def test_bridge_daily_success():
-    cron_manager = FakeCronManager()
-    angel_context = FakeAngelContext(cron_manager)
-    bridge = ReminderTaskBridge(DummyConfig(), angel_context)
-    event = FakeEvent("每天晚上11点提醒我睡觉")
-    handled = await bridge.try_handle(event)
-    assert handled is True
-    assert event.stopped is True
-    assert len(cron_manager.calls) == 1
-    assert cron_manager.calls[0]["run_once"] is False
-    assert cron_manager.calls[0]["cron_expression"] == "0 23 * * *"
-    assert "每天 23:00" in angel_context.astr_context.sent_messages[0][1]
-
-
-async def test_bridge_monthly_success():
-    cron_manager = FakeCronManager()
-    angel_context = FakeAngelContext(cron_manager)
-    bridge = ReminderTaskBridge(DummyConfig(), angel_context)
-    event = FakeEvent("每月15号上午10点提醒我交房租")
-    handled = await bridge.try_handle(event)
-    assert handled is True
-    assert event.stopped is True
-    assert len(cron_manager.calls) == 1
-    assert cron_manager.calls[0]["run_once"] is False
-    assert cron_manager.calls[0]["cron_expression"] == "0 10 15 * *"
-    assert "每月15号 10:00" in angel_context.astr_context.sent_messages[0][1]
-
-
-async def test_bridge_workday_success():
-    cron_manager = FakeCronManager()
-    angel_context = FakeAngelContext(cron_manager)
-    bridge = ReminderTaskBridge(DummyConfig(), angel_context)
-    event = FakeEvent("工作日早上9点提醒我打卡")
-    handled = await bridge.try_handle(event)
-    assert handled is True
-    assert event.stopped is True
-    assert cron_manager.calls[0]["cron_expression"] == "0 9 * * mon-fri"
-    assert "工作日 09:00" in angel_context.astr_context.sent_messages[0][1]
-
-
-async def test_bridge_monthly_last_day_success():
-    cron_manager = FakeCronManager()
-    angel_context = FakeAngelContext(cron_manager)
-    bridge = ReminderTaskBridge(DummyConfig(), angel_context)
-    event = FakeEvent("每月最后一天晚上8点提醒我做结算")
-    handled = await bridge.try_handle(event)
-    assert handled is True
-    assert event.stopped is True
-    assert cron_manager.calls[0]["run_once"] is False
-    assert cron_manager.calls[0]["cron_expression"] == "0 20 28-31 * *"
-    assert "每月最后一天 20:00" in angel_context.astr_context.sent_messages[0][1]
-
-
-async def test_bridge_every_two_days_success():
-    cron_manager = FakeCronManager()
-    angel_context = FakeAngelContext(cron_manager)
-    bridge = ReminderTaskBridge(DummyConfig(), angel_context)
-    event = FakeEvent("每隔两天早上9点提醒我浇花")
-    handled = await bridge.try_handle(event)
-    assert handled is True
-    assert event.stopped is True
-    assert cron_manager.calls[0]["run_once"] is False
-    assert cron_manager.calls[0]["cron_expression"] == "0 9 */2 * *"
-    assert "每隔2天 09:00" in angel_context.astr_context.sent_messages[0][1]
-
-
-async def test_bridge_parse_failure():
-    cron_manager = FakeCronManager()
-    angel_context = FakeAngelContext(cron_manager)
-    bridge = ReminderTaskBridge(DummyConfig(), angel_context)
-    event = FakeEvent("提醒我开会")
-    handled = await bridge.try_handle(event)
-    assert handled is True
-    assert event.stopped is True
+    assert len(cron_manager.basic_calls) == 1
     assert len(cron_manager.calls) == 0
-    assert "提醒没创建成功" in angel_context.astr_context.sent_messages[0][1]
 
 
-async def test_bridge_disabled():
+async def test_bridge_delivery_uses_active_agent_job():
     cron_manager = FakeCronManager()
     angel_context = FakeAngelContext(cron_manager)
-    config = DummyConfig()
-    config.reminder_future_task_enabled = False
-    bridge = ReminderTaskBridge(config, angel_context)
-    event = FakeEvent("明天早上 8 点提醒我开会")
+    bridge = ReminderTaskBridge(DummyConfig(), angel_context)
+    event = FakeEvent("每天早上7点推送江阴本地天气情况，不需要覆盖")
     handled = await bridge.try_handle(event)
-    assert handled is False
-    assert event.stopped is False
-    assert not cron_manager.calls
+    assert handled is True
+    assert len(cron_manager.calls) == 1
+    assert len(cron_manager.basic_calls) == 0
+
+
+async def test_direct_handler_deletes_one_shot():
+    cron_manager = FakeCronManager()
+    angel_context = FakeAngelContext(cron_manager)
+    bridge = ReminderTaskBridge(DummyConfig(), angel_context)
+    handler = bridge._build_direct_reminder_handler()
+    await handler(
+        chat_id="napcat:GroupMessage:925351983",
+        sender_id="913855876",
+        reminder_text="开户",
+        run_once_direct=True,
+        job_id="basic-1",
+    )
+    assert "提醒你：开户" in angel_context.astr_context.sent_messages[0][1]
+    assert cron_manager.deleted == ["basic-1"]
+
+
+async def test_bridge_list_tasks_success():
+    cron_manager = FakeCronManager()
+    cron_manager.jobs = [FakeJob(job_id="job-1"), FakeJob(job_id="job-2", name="推送:天气")]
+    angel_context = FakeAngelContext(cron_manager)
+    bridge = ReminderTaskBridge(DummyConfig(), angel_context)
+    event = FakeEvent("列出当前任务")
+    handled = await bridge.try_handle(event)
+    assert handled is True
+    assert "当前 future task" in angel_context.astr_context.sent_messages[0][1]
+
+
+async def test_bridge_delete_tasks_success():
+    cron_manager = FakeCronManager()
+    cron_manager.jobs = [
+        FakeJob(job_id="job-1", name="推送:天气", description="请向LuckyCai推送：江阴本地天气情况。"),
+        FakeJob(job_id="job-2", name="提醒:开会", description="请提醒LuckyCai：开会。"),
+    ]
+    angel_context = FakeAngelContext(cron_manager)
+    bridge = ReminderTaskBridge(DummyConfig(), angel_context)
+    event = FakeEvent("删除天气任务")
+    handled = await bridge.try_handle(event)
+    assert handled is True
+    assert cron_manager.deleted == ["job-1"]
 
 
 async def main():
     test_parse_success()
-    test_parse_relative_success()
-    test_parse_weekly_success()
-    test_parse_next_week_success()
-    test_parse_default_period_success()
-    test_parse_daily_success()
-    test_parse_workday_success()
-    test_parse_monthly_success()
-    test_parse_chinese_time_success()
-    test_parse_next_month_success()
-    test_parse_month_end_success()
-    test_parse_weekend_success()
-    test_parse_tonight_with_explicit_time_success()
-    test_parse_next_day_alias_success()
-    test_parse_next_next_week_success()
-    test_parse_month_start_success()
-    test_parse_chinese_minute_success()
-    test_parse_spoken_minute_success()
-    test_parse_every_other_week_single_success()
-    test_parse_monthly_last_day_success()
-    test_parse_every_two_days_success()
-    test_parse_quarter_end_success()
-    test_parse_first_workday_success()
-    await test_bridge_success()
-    await test_bridge_weekly_success()
-    await test_bridge_daily_success()
-    await test_bridge_monthly_success()
-    await test_bridge_workday_success()
-    await test_bridge_monthly_last_day_success()
-    await test_bridge_every_two_days_success()
-    await test_bridge_parse_failure()
-    await test_bridge_disabled()
-    print("reminder bridge regression: 34/34 passed")
+    test_parse_delivery_keep_existing_success()
+    await test_bridge_reminder_uses_direct_basic_job()
+    await test_bridge_delivery_uses_active_agent_job()
+    await test_direct_handler_deletes_one_shot()
+    await test_bridge_list_tasks_success()
+    await test_bridge_delete_tasks_success()
+    print("reminder bridge regression: 44/44 passed")
 
 
 if __name__ == "__main__":

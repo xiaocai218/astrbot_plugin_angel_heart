@@ -61,6 +61,36 @@
     "hint": "进入观测状态后，至少累计多少条未处理用户消息，秘书才会再次分析是否介入。建议 2 或 3。",
     "default": 2
   },
+  "observation_followup_score_threshold": {
+    "type": "int",
+    "description": "[基础配置] 观测中续聊放行分数阈值",
+    "hint": "用户明显在接 AI 继续聊时，累计达到多少分就强制放行回复。默认 4，数值越低越积极。",
+    "default": 4
+  },
+  "observation_followup_time_window": {
+    "type": "int",
+    "description": "[基础配置] 观测中续聊时间窗（秒）",
+    "hint": "AI 回复后，用户在多少秒内继续接话会被视为高概率在和 AI 聊天。",
+    "default": 120
+  },
+  "observation_followup_short_phrases": {
+    "type": "string",
+    "description": "[基础配置] 观测中短句承接词",
+    "hint": "多个词使用 | 分隔。用于识别“确实/也是/那倒是”这类明显在接 AI 的短句。",
+    "default": "确实|也是|那倒是|有道理|难说|还真是|对啊|对的|是啊|没错"
+  },
+  "observation_followup_question_phrases": {
+    "type": "string",
+    "description": "[基础配置] 观测中续聊追问词",
+    "hint": "多个词使用 | 分隔。用于识别“那后面呢/所以你的意思是/那现在咋办”这类继续追问。",
+    "default": "那后面呢|所以你的意思是|那现在咋办|那怎么办|那我这套|那怎么改|你觉得呢|继续说|展开讲讲"
+  },
+  "observation_followup_feedback_phrases": {
+    "type": "string",
+    "description": "[基础配置] 观测中反馈型承接词",
+    "hint": "多个词使用 | 分隔。用于识别“你这说得对/我就是这个意思/那你继续说”这类明显在回应 AI 的表达。",
+    "default": "你这说得对|我就是这个意思|那你继续说|你继续|你展开讲讲|你说得对|是这个意思"
+  },
   "air_reading_enabled": {
     "type": "bool",
     "description": "[读空气] 启用读空气预筛",
@@ -253,6 +283,12 @@
     "type": "bool",
     "description": "[提醒桥接] 启用提醒落未来任务",
     "hint": "启用后，像“明天早上8点提醒我开会”这类明确提醒请求会直接创建 AstrBot 未来任务，不再依赖主模型自己调用工具。",
+    "default": true
+  },
+  "reminder_direct_delivery_enabled": {
+    "type": "bool",
+    "description": "[提醒桥接] 提醒任务使用直发轨道",
+    "hint": "开启后，明确的“提醒我”类任务会走确定性直发，不再依赖 active_agent 到点后二次调用模型；推送/通知类任务仍保留 agent 轨道。",
     "default": true
   },
   "comfort_words": {

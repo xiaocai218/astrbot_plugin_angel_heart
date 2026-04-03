@@ -93,6 +93,12 @@ class AngelHeartPlugin(Star):
         """在LLM请求时，一次性注入由秘书分析得出的决策上下文"""
         chat_id = event.unified_msg_origin
 
+        if event.get_extra("angelheart_blocked_no_context", False):
+            logger.warning(
+                f"AngelHeart[{chat_id}]: 已命中无上下文保护，本轮跳过秘书决策注入。"
+            )
+            return
+
         # 示例：读取 angelheart_context（供其他插件参考）
         if hasattr(event, "angelheart_context"):
             try:
@@ -339,6 +345,15 @@ class AngelHeartPlugin(Star):
         parts = unified_id.split(":")
         return len(parts) >= 3 and parts[1] == "FriendMessage"
 
+    def _should_treat_as_natural_wake(self, event: AstrMessageEvent) -> bool:
+        """群聊 wake_prefix 命中后，区分自然语言唤醒与命令型唤醒。"""
+        activated_handlers = event.get_extra("activated_handlers", []) or []
+        if activated_handlers:
+            return False
+
+        message_str = str(event.get_message_str() or "").strip()
+        return bool(message_str)
+
     def _should_process(self, event: AstrMessageEvent) -> bool:
         """检查是否需要处理此消息"""
         chat_id = event.unified_msg_origin
@@ -387,10 +402,16 @@ class AngelHeartPlugin(Star):
                 elif has_at_all:
                     logger.debug(f"AngelHeart[{chat_id}]: 检测到@全体成员消息，已忽略")
                     return False
-                # 如果是指令（非@），不应该处理（返回False）
+                # 群聊唤醒词命中但未命中命令处理器，按自然语言唤醒进入秘书链
+                elif self._should_treat_as_natural_wake(event):
+                    logger.info(
+                        f"AngelHeart[{chat_id}]: 检测到自然语言唤醒，允许进入秘书缓存与分析流程。"
+                    )
+                    return True
+                # 如果是明确命令（非@），不应该处理（返回False）
                 else:
                     logger.debug(
-                        f"AngelHeart[{chat_id}]: 检测到指令或@他人消息，已忽略"
+                        f"AngelHeart[{chat_id}]: 检测到命令型唤醒或@他人消息，已忽略"
                     )
                     return False
 
@@ -569,6 +590,7 @@ class AngelHeartPlugin(Star):
                 # 4. 释放处理锁（设置冷却期）
                 await self.angel_context.release_chat_processing(chat_id, set_cooldown=True)
                 logger.info(f"AngelHeart[{chat_id}]: 任务处理完成，已在消息发送后释放处理锁。")
+                await self.front_desk.resume_deferred_if_any(chat_id)
             except Exception as release_error:
                 logger.error(
                     f"AngelHeart[{chat_id}]: after_message_sent 释放处理锁异常: {release_error}",
@@ -655,6 +677,10 @@ class AngelHeartPlugin(Star):
             # 清理所有 pending_events
             self.angel_context.pending_events.clear()
             logger.debug("AngelHeart: 已在terminate时清理所有pending_events")
+
+            # 清理所有 deferred_events
+            self.angel_context.deferred_events.clear()
+            logger.debug("AngelHeart: 已在terminate时清理所有deferred_events")
 
             # 取消所有扣押超时计时器
             for chat_id, timer in self.angel_context.detention_timeout_timers.items():

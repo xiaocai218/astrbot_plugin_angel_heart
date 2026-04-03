@@ -13,6 +13,8 @@ from ..core.utils import json_serialize_context
 
 from ..core.llm_analyzer import LLMAnalyzer
 from ..core.air_reading import AirReadingAnalyzer, AirReadingSignal
+from ..core.thread_window import ThreadWindowBuilder
+from ..core.decision_pipeline import DecisionPipeline
 from ..models.analysis_result import SecretaryDecision
 from ..core.angel_heart_status import StatusChecker, AngelHeartStatus
 from astrbot.api.event import AstrMessageEvent
@@ -62,6 +64,8 @@ class Secretary:
             analyzer_model_name, context, reply_strategy_guide, self.config_manager
         )
         self.air_reading_analyzer = AirReadingAnalyzer(config_manager)
+        self.thread_window_builder = ThreadWindowBuilder(config_manager)
+        self.decision_pipeline = DecisionPipeline(config_manager)
 
     async def handle_message_by_state(self, event: AstrMessageEvent) -> SecretaryDecision:
         """
@@ -113,9 +117,17 @@ class Secretary:
                 AngelHeartStatus.GETTING_FAMILIAR,
                 allow_suppression=True,
             )
+            envelope = self._build_decision_envelope(
+                event,
+                AngelHeartStatus.GETTING_FAMILIAR,
+                historical_context,
+                recent_dialogue,
+                air_signal,
+            )
             self._log_air_reading_signal(chat_id, air_signal)
-            if air_signal.should_suppress:
-                return self._build_suppressed_decision(air_signal, "混脸熟压制")
+            self._log_decision_envelope(chat_id, envelope)
+            if envelope.snapshot.hard_suppress:
+                return self._decision_from_envelope(envelope, "混脸熟压制")
 
             # 检测实际触发类型
             if self.status_checker._detect_echo_chamber(chat_id):
@@ -133,6 +145,7 @@ class Secretary:
                 chat_id, event, trigger_type
             )
             self._attach_air_signal(decision, air_signal)
+            self._apply_envelope_to_decision(decision, envelope)
 
             return decision
 
@@ -154,6 +167,13 @@ class Secretary:
                 AngelHeartStatus.SUMMONED,
                 allow_suppression=False,
             )
+            envelope = self._build_decision_envelope(
+                event,
+                AngelHeartStatus.SUMMONED,
+                historical_context,
+                recent_dialogue,
+                air_signal,
+            )
 
             if not recent_dialogue:
                 logger.info(f"AngelHeart[{chat_id}]: 无新消息需要分析。")
@@ -164,12 +184,17 @@ class Secretary:
 
             # 执行分析
             self._log_air_reading_signal(chat_id, air_signal)
+            self._log_decision_envelope(chat_id, envelope)
+            if envelope.snapshot.hard_suppress:
+                return self._decision_from_envelope(envelope, "被呼唤压制")
             decision = await self.perform_analysis(recent_dialogue, historical_context, chat_id, air_signal=air_signal)
+            self._apply_envelope_to_decision(decision, envelope)
 
             # 根据配置决定是否强制回复
             if self.config_manager.force_reply_when_summoned:
                 decision.should_reply = True
                 decision.reply_strategy = "被呼唤回复"
+                decision.final_reason = "summoned_force_reply"
 
             return decision
 
@@ -191,6 +216,13 @@ class Secretary:
                 AngelHeartStatus.OBSERVATION,
                 allow_suppression=True,
             )
+            envelope = self._build_decision_envelope(
+                event,
+                AngelHeartStatus.OBSERVATION,
+                historical_context,
+                recent_dialogue,
+                air_signal,
+            )
 
             if not recent_dialogue:
                 logger.info(f"AngelHeart[{chat_id}]: 无新消息需要分析。")
@@ -202,17 +234,28 @@ class Secretary:
             user_message_count = self._count_recent_user_messages(recent_dialogue)
             min_messages = self.config_manager.observation_min_messages
             if user_message_count < min_messages:
-                logger.info(
-                    f"AngelHeart[{chat_id}]: 观测中累计用户消息 {user_message_count}/{min_messages}，继续观察。"
-                )
-                return SecretaryDecision(
-                    should_reply=False, reply_strategy="继续观察", topic="观测阈值未达",
-                    entities=[], facts=[], keywords=[]
-                )
+                if envelope.snapshot.hard_allow or self._should_bypass_observation_threshold(historical_context, recent_dialogue, air_signal):
+                    logger.info(
+                        f"AngelHeart[{chat_id}]: 观测态直接续聊命中，绕过消息阈值 {user_message_count}/{min_messages}。"
+                    )
+                else:
+                    logger.info(
+                        f"AngelHeart[{chat_id}]: 观测中累计用户消息 {user_message_count}/{min_messages}，继续观察。"
+                    )
+                    return SecretaryDecision(
+                        should_reply=False, reply_strategy="继续观察", topic="观测阈值未达",
+                        entities=[], facts=[], keywords=[]
+                    )
 
             # 执行分析
             self._log_air_reading_signal(chat_id, air_signal)
+            self._log_decision_envelope(chat_id, envelope)
+            if envelope.snapshot.hard_allow:
+                return self._decision_from_envelope(envelope, "直接续聊")
+            if envelope.snapshot.hard_suppress:
+                return self._decision_from_envelope(envelope, "继续观察")
             decision = await self.perform_analysis(recent_dialogue, historical_context, chat_id, air_signal=air_signal)
+            self._apply_envelope_to_decision(decision, envelope)
 
             return decision
 
@@ -226,6 +269,224 @@ class Secretary:
     def _count_recent_user_messages(self, recent_dialogue: List[Dict]) -> int:
         """统计最近未处理消息中的用户消息数量。"""
         return sum(1 for msg in recent_dialogue if msg.get("role") == "user")
+
+    def _should_bypass_observation_threshold(
+        self,
+        historical_context: List[Dict],
+        recent_dialogue: List[Dict],
+        air_signal: AirReadingSignal,
+    ) -> bool:
+        """观测态下，允许明显接 AI 的直接续聊绕过最小消息数阈值。"""
+        if len(recent_dialogue) != 1:
+            return False
+
+        latest_message = recent_dialogue[-1]
+        if latest_message.get("role") != "user":
+            return False
+
+        previous_messages = [msg for msg in historical_context if isinstance(msg, dict)]
+        if not previous_messages:
+            return False
+
+        last_processed = previous_messages[-1]
+        if last_processed.get("role") != "assistant":
+            return False
+
+        latest_text = self._extract_message_text(latest_message)
+        assistant_text = self._extract_message_text(last_processed)
+        if not latest_text or not assistant_text:
+            return False
+
+        latest_ts = float(latest_message.get("timestamp") or 0)
+        assistant_ts = float(last_processed.get("timestamp") or 0)
+        if latest_ts <= 0 or assistant_ts <= 0:
+            return False
+
+        if latest_ts - assistant_ts > 90:
+            return False
+
+        if air_signal.conversation_mode == "directed_to_ai":
+            return True
+
+        if len(latest_text) < 6:
+            return False
+
+        normalized_latest = set(self._tokenize_text(latest_text))
+        normalized_assistant = set(self._tokenize_text(assistant_text))
+        if not normalized_latest or not normalized_assistant:
+            return False
+
+        overlap = normalized_latest & normalized_assistant
+        return bool(overlap)
+
+    def _is_direct_followup_to_ai(
+        self,
+        historical_context: List[Dict],
+        recent_dialogue: List[Dict],
+        air_signal: AirReadingSignal,
+    ) -> bool:
+        """判断当前轮是否明显在继续接 AI 的上一轮话题。"""
+        score = self._score_direct_followup_to_ai(
+            historical_context,
+            recent_dialogue,
+            air_signal,
+        )
+        return score >= self.config_manager.observation_followup_score_threshold
+
+    def _score_direct_followup_to_ai(
+        self,
+        historical_context: List[Dict],
+        recent_dialogue: List[Dict],
+        air_signal: AirReadingSignal,
+    ) -> int:
+        """为“是否明显在继续接 AI 聊天”打分。"""
+        if not recent_dialogue:
+            return 0
+
+        latest_user_message = None
+        user_messages = [message for message in recent_dialogue if message.get("role") == "user"]
+        if user_messages:
+            latest_user_message = user_messages[-1]
+
+        if not latest_user_message:
+            return 0
+
+        previous_messages = [msg for msg in historical_context if isinstance(msg, dict)]
+        if not previous_messages:
+            return 0
+
+        last_processed = previous_messages[-1]
+        if last_processed.get("role") != "assistant":
+            return 0
+
+        latest_text = self._extract_message_text(latest_user_message)
+        assistant_text = self._extract_message_text(last_processed)
+        latest_ts = float(latest_user_message.get("timestamp") or 0)
+        assistant_ts = float(last_processed.get("timestamp") or 0)
+        time_gap = latest_ts - assistant_ts if latest_ts > 0 and assistant_ts > 0 else 999999
+
+        score = 0
+        reply_self = latest_user_message.get("summon_source") == "reply_self"
+        directed = air_signal.conversation_mode == "directed_to_ai"
+        same_sender_streak = False
+        short_phrase = False
+        question_phrase = False
+        feedback_phrase = False
+        carry_over = False
+        text_overlap = False
+
+        if reply_self:
+            score += 5
+        if directed:
+            score += 4
+        if time_gap <= self.config_manager.observation_followup_time_window:
+            score += 2
+        if len(user_messages) >= 2:
+            sender_ids = [str(msg.get("sender_id") or "") for msg in user_messages[-3:]]
+            if len(set(sender_ids)) == 1 and sender_ids[0]:
+                same_sender_streak = True
+                score += 2
+        if latest_text:
+            lowered = latest_text.lower()
+            if self._contains_any_phrase(lowered, self.config_manager.observation_followup_short_phrases):
+                short_phrase = True
+                score += 2
+            if self._contains_any_phrase(lowered, self.config_manager.observation_followup_question_phrases):
+                question_phrase = True
+                score += 3
+            if self._contains_any_phrase(lowered, self.config_manager.observation_followup_feedback_phrases):
+                feedback_phrase = True
+                score += 3
+            if len(latest_text) <= 6:
+                score += 1
+        if self._should_bypass_observation_threshold(historical_context, [latest_user_message], air_signal):
+            carry_over = True
+            score += 3
+        if latest_text and assistant_text:
+            normalized_latest = set(self._tokenize_text(latest_text))
+            normalized_assistant = set(self._tokenize_text(assistant_text))
+            if normalized_latest and normalized_assistant and (normalized_latest & normalized_assistant):
+                text_overlap = True
+                score += 2
+
+        logger.info(
+            f"观测态续聊评分 | score={score} | threshold={self.config_manager.observation_followup_score_threshold} "
+            f"| time_gap={int(time_gap) if time_gap < 999999 else -1}s | directed={directed} | reply_self={reply_self} "
+            f"| same_sender_streak={same_sender_streak} | short_phrase={short_phrase} "
+            f"| question_phrase={question_phrase} | feedback_phrase={feedback_phrase} "
+            f"| carry_over={carry_over} | text_overlap={text_overlap}"
+        )
+
+        return score
+
+    def _apply_observation_followup_override(
+        self,
+        chat_id: str,
+        decision: SecretaryDecision,
+        historical_context: List[Dict],
+        recent_dialogue: List[Dict],
+        air_signal: AirReadingSignal,
+    ) -> None:
+        """观测态下，如果明显在接 AI 聊天，则对不回复结果做后置强放行。"""
+        if not decision or decision.should_reply:
+            return
+
+        if air_signal.suppression_reason == "heated_conflict":
+            return
+
+        followup_score = self._score_direct_followup_to_ai(
+            historical_context,
+            recent_dialogue,
+            air_signal,
+        )
+        threshold = self.config_manager.observation_followup_score_threshold
+        if followup_score < threshold:
+            return
+
+        logger.info(
+            f"AngelHeart[{chat_id}]: 命中明显续聊 AI，覆盖轻量模型的“不参与”结果，强制放行本轮回复。score={followup_score}/{threshold}"
+        )
+        decision.should_reply = True
+        decision.is_directly_addressed = True
+        decision.reply_strategy = "直接续聊放行"
+        if not decision.reply_target:
+            latest_user = next(
+                (msg for msg in reversed(recent_dialogue) if msg.get("role") == "user"),
+                None,
+            )
+            if latest_user:
+                decision.reply_target = str(
+                    latest_user.get("sender_name")
+                    or latest_user.get("sender_id")
+                    or ""
+                )
+        if not decision.topic or decision.topic == "未知":
+            decision.topic = "延续上一轮对话"
+
+    def _extract_message_text(self, message: Dict) -> str:
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            texts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text = str(item.get("text") or "").strip()
+                    if text:
+                        texts.append(text)
+            return " ".join(texts).strip()
+        return ""
+
+    def _tokenize_text(self, text: str) -> List[str]:
+        normalized = str(text or "").strip().lower()
+        normalized = "".join(ch if (ch.isalnum() or "\u4e00" <= ch <= "\u9fff") else " " for ch in normalized)
+        return [token for token in normalized.split() if len(token) >= 2]
+
+    def _contains_any_phrase(self, lowered_text: str, phrases: List[str]) -> bool:
+        """判断文本是否命中任一配置短语。"""
+        if not lowered_text:
+            return False
+        return any(str(phrase).strip().lower() in lowered_text for phrase in phrases if str(phrase).strip())
 
     def _build_air_signal(
         self,
@@ -266,6 +527,98 @@ class Secretary:
         )
         return historical_context, recent_dialogue, air_signal
 
+    def _get_latest_user_message(self, recent_dialogue: List[Dict]) -> Dict | None:
+        for message in reversed(recent_dialogue):
+            if message.get("role") == "user":
+                return message
+        return None
+
+    def _is_command_like_wake(self, event: AstrMessageEvent, latest_user_message: Dict | None) -> bool:
+        if not getattr(event, "is_at_or_wake_command", False):
+            return False
+        if latest_user_message and latest_user_message.get("summon_source") in {"at_self", "reply_self"}:
+            return False
+        activated_handlers = event.get_extra("activated_handlers", []) or []
+        return bool(activated_handlers)
+
+    def _build_decision_envelope(
+        self,
+        event: AstrMessageEvent,
+        current_status: AngelHeartStatus,
+        historical_context: List[Dict],
+        recent_dialogue: List[Dict],
+        air_signal: AirReadingSignal,
+    ):
+        latest_user_message = self._get_latest_user_message(recent_dialogue)
+        thread_window = self.thread_window_builder.build(historical_context, recent_dialogue)
+        followup_score = self._score_direct_followup_to_ai(
+            historical_context,
+            recent_dialogue,
+            air_signal,
+        )
+        thread_window.followup_score = followup_score
+        thread_window.engagement_hint = air_signal.engagement_hint
+        snapshot = self.decision_pipeline.build_snapshot(
+            status=current_status,
+            thread_window=thread_window,
+            air_signal=air_signal,
+            latest_user_message=latest_user_message,
+            followup_score=followup_score,
+            command_like_wake=self._is_command_like_wake(event, latest_user_message),
+        )
+        return self.decision_pipeline.start_envelope(snapshot, current_status)
+
+    def _apply_envelope_to_decision(self, decision: SecretaryDecision, envelope) -> SecretaryDecision:
+        llm_review = {
+            "needs_reply_now": decision.should_reply,
+            "addressing_mode": decision.addressing_mode or "unclear",
+            "reply_value": decision.reply_value or ("high" if decision.is_interesting else "low"),
+        }
+        envelope = self.decision_pipeline.apply_llm_review(envelope, llm_review)
+        snapshot = envelope.snapshot
+
+        decision.hard_allow = snapshot.hard_allow
+        decision.hard_suppress = snapshot.hard_suppress
+        decision.followup_score = snapshot.followup_score
+        decision.thread_topic = snapshot.thread_window.thread_topic_hint
+        decision.final_reason = envelope.final_reason
+        if decision.addressing_mode == "unclear":
+            if snapshot.hard_allow:
+                decision.addressing_mode = "to_ai"
+            elif snapshot.hard_suppress and snapshot.hard_suppress_reason == "human_private_exchange":
+                decision.addressing_mode = "to_human"
+
+        decision.should_reply = envelope.final_should_reply
+        if not decision.reply_strategy or decision.reply_strategy == "继续观察":
+            decision.reply_strategy = envelope.final_reason or "继续观察"
+        if not decision.topic or decision.topic == "未知":
+            decision.topic = snapshot.thread_window.thread_topic_hint or "未知"
+        if not decision.reply_target:
+            decision.reply_target = snapshot.thread_window.thread_target_hint
+        return decision
+
+    def _decision_from_envelope(self, envelope, fallback_topic: str) -> SecretaryDecision:
+        snapshot = envelope.snapshot
+        return SecretaryDecision(
+            should_reply=envelope.final_should_reply,
+            reply_strategy=envelope.final_reason or "继续观察",
+            topic=snapshot.thread_window.thread_topic_hint or fallback_topic,
+            reply_target=snapshot.thread_window.thread_target_hint,
+            air_score=snapshot.air_score,
+            followup_score=snapshot.followup_score,
+            should_suppress=snapshot.hard_suppress,
+            suppression_reason=snapshot.hard_suppress_reason,
+            conversation_mode="general_discussion",
+            engagement_hint=snapshot.thread_window.engagement_hint,
+            hard_allow=snapshot.hard_allow,
+            hard_suppress=snapshot.hard_suppress,
+            final_reason=envelope.final_reason,
+            thread_topic=snapshot.thread_window.thread_topic_hint,
+            entities=[],
+            facts=[],
+            keywords=[],
+        )
+
     def _attach_air_signal(self, decision: SecretaryDecision, air_signal: AirReadingSignal) -> SecretaryDecision:
         """把读空气信号附着到决策对象。"""
         decision.air_score = air_signal.air_score
@@ -305,6 +658,22 @@ class Secretary:
                 f"AngelHeart[{chat_id}]: 读空气放行 | mode={air_signal.conversation_mode} "
                 f"| score={air_signal.air_score}"
             )
+
+    def _log_decision_envelope(self, chat_id: str, envelope) -> None:
+        snapshot = envelope.snapshot
+        logger.info(
+            f"DecisionGate[{chat_id}] | status={envelope.status_name} "
+            f"| hard_allow={snapshot.hard_allow}:{snapshot.hard_allow_reason or 'none'} "
+            f"| hard_suppress={snapshot.hard_suppress}:{snapshot.hard_suppress_reason or 'none'} "
+            f"| air_score={snapshot.air_score} | followup_score={snapshot.followup_score} "
+            f"| thread_confidence={snapshot.thread_window.thread_confidence}"
+        )
+        logger.info(
+            f"ThreadWindow[{chat_id}] | topic={snapshot.thread_window.thread_topic_hint or '未知'} "
+            f"| target={snapshot.thread_window.thread_target_hint or '未知'} "
+            f"| messages={len(snapshot.thread_window.current_thread_messages)} "
+            f"| burst={len(snapshot.thread_window.latest_user_burst)}"
+        )
 
     def _log_analysis_result(self, chat_id: str, state_name: str, decision: SecretaryDecision) -> None:
         """统一记录秘书分析结果，便于直接观察参与/不参与结论。"""
