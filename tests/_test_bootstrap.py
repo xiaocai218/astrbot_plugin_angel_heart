@@ -154,7 +154,11 @@ if "astrbot" not in sys.modules:
         pass
 
     class _FakeMessageChain(list):
-        pass
+        def __init__(self, chain=None):
+            items = list(chain or [])
+            super().__init__(items)
+            self.chain = items
+
 
     class _FakeContext:
         async def send_message(self, *args, **kwargs):
@@ -163,6 +167,7 @@ if "astrbot" not in sys.modules:
     class _FakeAt:
         def __init__(self, qq=""):
             self.qq = qq
+            self.text = f"@{qq}"
 
     class _FakeImage:
         def __init__(self, url="", file=""):
