@@ -1,7 +1,8 @@
 import asyncio
+import time
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from tests import _test_bootstrap  # noqa: F401
 
@@ -11,6 +12,8 @@ from astrbot_plugin_angel_heart.roles.front_desk import FrontDesk
 
 class _Config:
     alias = "AngelHeart"
+    slap_words = "闭嘴|别说话"
+    silence_duration = 600
 
 
 class _Ledger:
@@ -81,11 +84,18 @@ class FrontDeskRewritePromptTests(unittest.IsolatedAsyncioTestCase):
                 get_event_queue=lambda: queue,
             ),
             pop_deferred_event=lambda chat_id: None,
+            silenced_until={},
+            is_not_present=lambda chat_id: False,
         )
         front_desk.astr_context = front_desk.context.astr_context
         front_desk.thread_window_builder = ThreadWindowBuilder(_Config())
         front_desk.secretary = None
         front_desk.filter_images_for_provider = lambda chat_id, contexts: contexts
+        front_desk._check_and_handle_timeout = AsyncMock()
+        front_desk.cache_message = AsyncMock()
+        front_desk._ensure_minimum_context = AsyncMock()
+        front_desk._notify_secretary = AsyncMock()
+        front_desk.reminder_task_bridge = types.SimpleNamespace(try_handle=AsyncMock(return_value=False))
         return front_desk
 
     async def test_group_chat_falls_back_to_current_event_when_ledger_is_empty(self):
@@ -119,6 +129,31 @@ class FrontDeskRewritePromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(event.get_extra("angelheart_replayed", False))
         self.assertFalse(event.cleared)
         self.assertFalse(event.continued)
+
+
+    async def test_handle_event_enters_silence_when_slap_word_matches(self):
+        front_desk = self._build_front_desk()
+        event = _Event()
+        event.get_message_outline = lambda: "你先闭嘴"
+
+        await front_desk.handle_event(event)
+
+        self.assertTrue(event.stopped)
+        self.assertIn(event.unified_msg_origin, front_desk.context.silenced_until)
+        self.assertGreater(front_desk.context.silenced_until[event.unified_msg_origin], time.time())
+        front_desk.cache_message.assert_not_awaited()
+        front_desk._notify_secretary.assert_not_awaited()
+
+    async def test_handle_event_stops_during_existing_silence_window(self):
+        front_desk = self._build_front_desk()
+        event = _Event()
+        front_desk.context.silenced_until[event.unified_msg_origin] = time.time() + 120
+
+        await front_desk.handle_event(event)
+
+        self.assertTrue(event.stopped)
+        front_desk.cache_message.assert_not_awaited()
+        front_desk._notify_secretary.assert_not_awaited()
 
 
 if __name__ == "__main__":
