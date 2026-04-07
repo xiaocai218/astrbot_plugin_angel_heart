@@ -76,6 +76,30 @@ class SecretaryStateFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.reply_strategy, "command_like_wake")
         self.assertTrue(decision.hard_suppress)
 
+    async def test_summoned_hard_allow_short_circuits_llm(self):
+        secretary = self._build_secretary()
+        event = types.SimpleNamespace(unified_msg_origin="chat-1")
+        air_signal = AirReadingSignal(air_score=6, conversation_mode="directed_to_ai")
+        envelope = self._build_envelope(
+            hard_allow=True,
+            hard_allow_reason="at_self",
+            final_should_reply=True,
+            final_reason="at_self",
+        )
+
+        secretary._prepare_air_analysis = lambda *args, **kwargs: ([], [{"role": "user", "content": "@bot 先扣分"}], air_signal)
+        secretary._build_decision_envelope = lambda *args, **kwargs: envelope
+        secretary._log_air_reading_signal = lambda *args, **kwargs: None
+        secretary._log_decision_envelope = lambda *args, **kwargs: None
+        secretary.perform_analysis = AsyncMock(side_effect=AssertionError("LLM should not run"))
+
+        decision = await secretary._handle_summoned_reply(event, "chat-1")
+
+        self.assertTrue(decision.should_reply)
+        self.assertEqual(decision.final_reason, "at_self")
+        self.assertEqual(decision.reply_strategy, "at_self")
+        self.assertTrue(decision.hard_allow)
+
     async def test_summoned_force_reply_overrides_llm_rejection(self):
         secretary = self._build_secretary()
         secretary._config_manager.force_reply_when_summoned = True

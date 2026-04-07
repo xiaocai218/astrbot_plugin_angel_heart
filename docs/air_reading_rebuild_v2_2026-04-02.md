@@ -43,6 +43,7 @@
 - `ThreadWindowBuilder` 已增加 topic hint 清洗，去掉引用、@ 标记和表情占位，减少主链提示词污染。
 - `ThreadWindowBuilder.thread_confidence` 已把“无 assistant 锚点”和“recent 被截断”纳入降权，线程窗口现在不再只会单向加分。
 - `DecisionPipeline.apply_llm_review()` 已把低 `thread_confidence` 接入 `llm_high_value` 路径的弱保护，只压制“非 to_ai、非 hard_allow”的模糊高价值回复。
+- `SUMMONED` 分支已补齐 `hard_allow` 本地短路，命中 `at_self` / `reply_self` 后不再继续调用 LLM 覆盖当前话题。
 
 ### 已完成验证
 
@@ -61,6 +62,7 @@
 13. `tests/test_decision_pipeline.py` 已覆盖 topic hint 对引用、@ 标记、表情占位的清洗行为。
 14. `tests/test_decision_pipeline.py` 已覆盖 `thread_confidence` 在“有锚点 / 无锚点 / 无锚点且 recent 截断”三档下的降权关系。
 15. `tests/test_decision_pipeline.py` 已覆盖低 `thread_confidence` 对 `unclear + high reply_value` 的弱保护，以及 `to_ai` 对该保护的绕过。
+16. `tests/test_secretary_state_flows.py` 已覆盖 `SUMMONED` 命中 `hard_allow=at_self` 时直接短路，不再继续调用 LLM。
 
 ### 故障记录
 
@@ -105,6 +107,12 @@
    - 根因：`DecisionPipeline` 之前没有消费 `thread_confidence`，导致低质量线程和高质量线程在 `llm_high_value` 分支里权重一致。
    - 修复：仅在 `llm_high_value` 分支增加 `thread_confidence_guard`，低置信度时回退到继续观察；`to_ai`、`hard_allow` 不受影响。
    - 回归测试：`tests/test_decision_pipeline.py`。
+
+8. 2026-04-07 被呼唤读偏上文：线上日志显示 `hard_allow=True:at_self` 已命中，但秘书仍继续调用 LLM，最终把话题改写成上文的群聊互动。
+   - 现象：用户明确 @ 机器人后，最终回复仍围绕旧线程展开，看起来像“没响应 @，反而在读上文”。
+   - 根因：`_handle_summoned_reply()` 只有 `hard_suppress` 短路，没有对 `hard_allow` 直接放行，导致 LLM 继续分析并覆盖了本地已确定的当前话题。
+   - 修复：命中 `hard_allow` 时直接 `_decision_from_envelope()` 返回，不再进入 `perform_analysis()`。
+   - 回归测试：`tests/test_secretary_state_flows.py`。
 
 ### 当前收口项
 

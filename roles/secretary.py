@@ -187,6 +187,13 @@ class Secretary:
             self._log_decision_envelope(chat_id, envelope)
             if envelope.snapshot.hard_suppress:
                 return self._decision_from_envelope(envelope, "被呼唤压制")
+            if envelope.snapshot.hard_allow:
+                decision = self._decision_from_envelope(envelope, "被呼唤直达")
+                if self.config_manager.force_reply_when_summoned:
+                    decision.should_reply = True
+                    decision.reply_strategy = "被呼唤回复"
+                    decision.final_reason = "summoned_force_reply"
+                return decision
             decision = await self.perform_analysis(recent_dialogue, historical_context, chat_id, air_signal=air_signal)
             self._apply_envelope_to_decision(decision, envelope)
 
